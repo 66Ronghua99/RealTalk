@@ -12,6 +12,8 @@ def setup_logger(
     """Set up a logger with the specified configuration."""
     logger = logging.getLogger(name)
     logger.setLevel(level)
+    # Disable propagation to prevent duplicate logs when child loggers have handlers
+    logger.propagate = False
 
     if not logger.handlers:
         handler = logging.StreamHandler(sys.stdout)
