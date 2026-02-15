@@ -1,11 +1,13 @@
 """Simple web server for RealTalk testing."""
 import asyncio
+import base64
 import json
 from pathlib import Path
 from typing import Optional
 
 import aiohttp
 from aiohttp import web
+import numpy as np
 
 from ..cognition.llm import OpenRouterLLM
 from ..cognition.tts import MinimaxTTS
@@ -14,6 +16,8 @@ from ..logging_config import setup_logger
 from ..orchestration.accumulator import ContextAccumulator, StubbornnessController
 from ..orchestration.fsm import Event, State
 from ..orchestration.gatekeeper import RuleBasedGatekeeper
+from ..perception.vad import WebRTCVAD
+from ..perception.asr import MinimaxASR
 
 logger = setup_logger("realtalk.web")
 
@@ -25,6 +29,8 @@ class RealTalkWebHandler:
         self._ws: Optional[web.WebSocketResponse] = None
         self._llm: Optional[OpenRouterLLM] = None
         self._tts: Optional[MinimaxTTS] = None
+        self._vad: Optional[WebRTCVAD] = None
+        self._asr: Optional[MinimaxASR] = None
         self._gatekeeper: Optional[RuleBasedGatekeeper] = None
         self._accumulator: Optional[ContextAccumulator] = None
         self._stubbornness: Optional[StubbornnessController] = None
@@ -32,6 +38,7 @@ class RealTalkWebHandler:
         self._current_state = State.IDLE
         self._current_text = ""
         self._is_speaking = False
+        self._audio_buffer: list = []
 
     async def init(self):
         """Initialize components."""
@@ -42,6 +49,11 @@ class RealTalkWebHandler:
             model_name=cfg.llm.model_name
         )
         self._tts = MinimaxTTS(
+            api_key=cfg.api.minimax_api_key,
+            group_id=cfg.api.minimax_group_id
+        )
+        self._vad = WebRTCVAD()
+        self._asr = MinimaxASR(
             api_key=cfg.api.minimax_api_key,
             group_id=cfg.api.minimax_group_id
         )
@@ -101,6 +113,21 @@ class RealTalkWebHandler:
                 "message": "Context cleared"
             })
 
+        elif msg_type == "audio":
+            # Process audio from microphone
+            audio_data = data.get("data", "")
+            await self._process_audio(audio_data)
+
+        elif msg_type == "audio_start":
+            # User started speaking
+            self._current_state = State.LISTENING
+            self._audio_buffer.clear()
+            await self._send_to_client({"type": "state", "state": "listening"})
+
+        elif msg_type == "audio_end":
+            # User stopped speaking - process accumulated audio
+            await self._process_audio_end()
+
     async def _process_text(self, text: str):
         """Process user text input."""
         self._current_text = text
@@ -137,6 +164,60 @@ class RealTalkWebHandler:
                 "type": "status",
                 "message": "Accumulated for context"
             })
+
+    async def _process_audio(self, audio_base64: str):
+        """Process incoming audio chunk from browser."""
+        try:
+            # Decode base64 audio
+            audio_bytes = base64.b64decode(audio_base64)
+            self._audio_buffer.append(audio_bytes)
+
+            # Convert to numpy for VAD
+            audio_array = np.frombuffer(audio_bytes, dtype=np.int16).astype(np.float32) / 32768.0
+
+            # Run VAD
+            vad_result = await self._vad.detect(audio_array)
+
+            await self._send_to_client({
+                "type": "vad",
+                "is_speaking": vad_result.is_speaking,
+                "energy": vad_result.energy
+            })
+        except Exception as e:
+            logger.error(f"Error processing audio: {e}")
+
+    async def _process_audio_end(self):
+        """Process accumulated audio when user stops speaking."""
+        if not self._audio_buffer:
+            return
+
+        # Combine all audio chunks
+        combined_audio = b"".join(self._audio_buffer)
+
+        # Run ASR
+        try:
+            asr_result = await self._asr.recognize(combined_audio)
+
+            if asr_result.text:
+                await self._send_to_client({
+                    "type": "transcript",
+                    "text": asr_result.text,
+                    "is_final": True
+                })
+                await self._process_text(asr_result.text)
+            else:
+                await self._send_to_client({
+                    "type": "status",
+                    "message": "No speech detected"
+                })
+        except Exception as e:
+            logger.error(f"ASR error: {e}")
+            await self._send_to_client({
+                "type": "status",
+                "message": f"ASR error: {e}"
+            })
+        finally:
+            self._audio_buffer.clear()
 
     async def _generate_response(self, text: str):
         """Generate LLM response and send TTS."""
@@ -338,11 +419,33 @@ def get_index_html() -> str:
         .control-group label { display: block; margin-bottom: 10px; }
         input[type="range"] { width: 100%; }
         .stubbornness-value { color: #00d9ff; font-weight: bold; }
+        .mic-button {
+            width: 60px;
+            height: 60px;
+            border-radius: 50%;
+            background: #ff4757;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            margin: 0 auto 20px;
+            font-size: 24px;
+        }
+        .mic-button.recording {
+            background: #ff0000;
+            animation: pulse 1s infinite;
+        }
+        @keyframes pulse {
+            0% { transform: scale(1); }
+            50% { transform: scale(1.1); }
+            100% { transform: scale(1); }
+        }
     </style>
 </head>
 <body>
     <div class="container">
         <h1>RealTalk - Voice Interaction</h1>
+
+        <button class="mic-button" id="micBtn" onclick="toggleMic()">🎤</button>
 
         <div class="status-bar">
             <div class="status-item">
@@ -438,6 +541,15 @@ def get_index_html() -> str:
                         document.getElementById('accumulated').textContent = accumulatedCount;
                     }
                     break;
+                case 'vad':
+                    // Update VAD status indicator
+                    const micBtn = document.getElementById('micBtn');
+                    if (data.is_speaking) {
+                        micBtn.style.background = '#00ff00';
+                    } else {
+                        micBtn.style.background = '#ff4757';
+                    }
+                    break;
             }
         }
 
@@ -491,6 +603,101 @@ def get_index_html() -> str:
                 ws.send(JSON.stringify({type: 'stubbornness', level: parseInt(e.target.value)}));
             }
         });
+
+        // Microphone audio capture
+        let mediaRecorder = null;
+        let audioChunks = [];
+        let isRecording = false;
+        let audioContext = null;
+        let analyser = null;
+        let micStream = null;
+
+        async function toggleMic() {
+            const btn = document.getElementById('micBtn');
+
+            if (!isRecording) {
+                // Start recording
+                try {
+                    micStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+
+                    audioContext = new (window.AudioContext || window.webkitAudioContext)();
+                    analyser = audioContext.createAnalyser();
+                    const source = audioContext.createMediaStreamSource(micStream);
+                    source.connect(analyser);
+                    analyser.fftSize = 256;
+
+                    mediaRecorder = new MediaRecorder(micStream);
+                    audioChunks = [];
+
+                    mediaRecorder.ondataavailable = (event) => {
+                        if (event.data.size > 0) {
+                            audioChunks.push(event.data);
+
+                            // Send audio chunk to server while recording
+                            const reader = new FileReader();
+                            reader.onload = () => {
+                                const arrayBuffer = reader.result;
+                                const uint8Array = new Uint8Array(arrayBuffer);
+                                let binary = '';
+                                for (let i = 0; i < uint8Array.length; i++) {
+                                    binary += String.fromCharCode(uint8Array[i]);
+                                }
+                                const base64 = btoa(binary);
+                                if (ws && ws.readyState === WebSocket.OPEN) {
+                                    ws.send(JSON.stringify({type: 'audio', data: base64}));
+                                }
+                            };
+                            reader.readAsArrayBuffer(event.data);
+                        }
+                    };
+
+                    mediaRecorder.onstop = async () => {
+                        const audioBlob = new Blob(audioChunks, { type: 'audio/webm' });
+                        const arrayBuffer = await audioBlob.arrayBuffer();
+                        const uint8Array = new Uint8Array(arrayBuffer);
+
+                        // Convert to base64
+                        let binary = '';
+                        for (let i = 0; i < uint8Array.length; i++) {
+                            binary += String.fromCharCode(uint8Array[i]);
+                        }
+                        const base64 = btoa(binary);
+
+                        if (ws && ws.readyState === WebSocket.OPEN) {
+                            ws.send(JSON.stringify({type: 'audio_end', data: base64}));
+                        }
+                    };
+
+                    mediaRecorder.start(100); // Send chunks every 100ms
+                    isRecording = true;
+                    btn.classList.add('recording');
+                    btn.textContent = '⏹';
+
+                    // Notify server recording started
+                    if (ws && ws.readyState === WebSocket.OPEN) {
+                        ws.send(JSON.stringify({type: 'audio_start'}));
+                    }
+
+                } catch (err) {
+                    addSystemMessage('Microphone error: ' + err.message);
+                }
+            } else {
+                // Stop recording
+                if (mediaRecorder && mediaRecorder.state !== 'inactive') {
+                    mediaRecorder.stop();
+                }
+                if (micStream) {
+                    micStream.getTracks().forEach(track => track.stop());
+                }
+                if (audioContext) {
+                    audioContext.close();
+                }
+
+                isRecording = false;
+                btn.classList.remove('recording');
+                btn.textContent = '🎤';
+            }
+        }
 
         connect();
     </script>
