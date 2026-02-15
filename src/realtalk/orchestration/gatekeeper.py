@@ -74,7 +74,7 @@ class RuleBasedGatekeeper(BaseGatekeeper):
 
         # Patterns for detecting interruption/intensity
         self._interruption_patterns = [
-            r"\b(?:闭嘴|别说了|停下|安静|吵死了|胡说|滚)\b",
+            r"\b(?:闭嘴|别说了|停下|安静|吵死了|胡说|滚|等等|等一下|stop|wait|)\b",
             r"[\!]{2,}",  # Multiple exclamation marks
             r"[A-Z]{3,}",  # All caps (shouting)
         ]
