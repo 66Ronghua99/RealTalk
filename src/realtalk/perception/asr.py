@@ -6,9 +6,11 @@ import json
 import time
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
+from pathlib import Path
 from typing import AsyncIterator, Optional
 
 import aiohttp
+import numpy as np
 
 from ..config import get_config
 from ..exceptions import ASRError
@@ -117,6 +119,7 @@ class MinimaxASR(BaseASR):
                     return ASRResult(text="", is_final=False)
 
                 result = await response.json()
+                logger.info(f"ASR API response: {result}")
                 text = result.get("data", {}).get("text", "")
                 is_final = result.get("data", {}).get("is_final", True)
 
@@ -158,80 +161,96 @@ class MinimaxASR(BaseASR):
             await self._session.close()
 
 
-class FasterWhisperASR(BaseASR):
-    """Faster-Whisper ASR implementation (local)."""
+class SherpaOnnxASR(BaseASR):
+    """Sherpa-ONNX ASR implementation using SenseVoice (local, fast)."""
 
     def __init__(
         self,
-        model_name: str = "small",
-        language: str = "auto",
-        device: str = "auto"
+        num_threads: int = 4,
+        sample_rate: int = 16000,
+        use_itn: bool = True,
     ):
-        self.model_name = model_name
-        self.language = language
-        self.device = device
-        self._model = None
+        self.num_threads = num_threads
+        self.sample_rate = sample_rate
+        self.use_itn = use_itn
+        self._recognizer = None
+        self._stream = None
 
     async def load(self) -> None:
-        """Load the Whisper model."""
+        """Load the Sherpa-ONNX SenseVoice ASR model."""
         try:
-            from faster_whisper import WhisperModel
+            import sherpa_onnx
 
-            self._model = WhisperModel(
-                self.model_name,
-                device=self.device,
-                compute_type="float16" if self.device == "cuda" else "int8"
+            # Download model if not exists
+            model_dir = Path.home() / ".cache" / "realtalk" / "models"
+            model_dir.mkdir(parents=True, exist_ok=True)
+
+            # SenseVoice model files
+            sense_voice_model = model_dir / "sense-voice" / "model.onnx"
+            tokens_file = model_dir / "sense-voice" / "tokens.txt"
+
+            if not sense_voice_model.exists():
+                logger.info("Downloading SenseVoice model...")
+                import urllib.request
+                import tarfile
+                import io
+
+                url = "https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/sherpa-onnx-sense-voice-zh-en-ja-ko-yue-2024-07-17.tar.bz2"
+
+                response = urllib.request.urlopen(url)
+                tar_data = io.BytesIO(response.read())
+                with tarfile.open(fileobj=tar_data) as tar:
+                    for member in tar.getmembers():
+                        if "model.onnx" in member.name:
+                            sense_voice_model.parent.mkdir(parents=True, exist_ok=True)
+                            sense_voice_model.write_bytes(tar.extractfile(member).read())
+                        if member.name.endswith("tokens.txt"):
+                            tokens_file.parent.mkdir(parents=True, exist_ok=True)
+                            tokens_file.write_bytes(tar.extractfile(member).read())
+
+            self._recognizer = sherpa_onnx.OfflineRecognizer.from_sense_voice(
+                model=str(sense_voice_model),
+                tokens=str(tokens_file),
+                num_threads=self.num_threads,
+                use_itn=self.use_itn,
             )
-            logger.info(f"Faster-Whisper model '{self.model_name}' loaded")
-        except ImportError:
-            logger.error("faster-whisper not installed")
-            raise ASRError("faster-whisper not installed")
+            logger.info("Sherpa-ONNX SenseVoice ASR loaded")
         except Exception as e:
-            logger.error(f"Failed to load Whisper model: {e}")
-            raise ASRError(f"Failed to load Whisper model: {e}")
+            logger.error(f"Failed to load Sherpa-ONNX: {e}")
+            raise ASRError(f"Failed to load Sherpa-ONNX: {e}")
 
     async def recognize(self, audio_chunk: bytes) -> ASRResult:
         """Recognize speech from audio chunk."""
-        if self._model is None:
+        if self._recognizer is None:
             await self.load()
 
         try:
-            import numpy as np
-            from io import BytesIO
-            import soundfile as sf
+            # Convert bytes to numpy array (16-bit PCM)
+            audio_array = np.frombuffer(audio_chunk, dtype=np.int16).astype(np.float32) / 32768.0
 
-            # Convert bytes to numpy array
-            audio_array, _ = sf.read(BytesIO(audio_chunk))
+            # Create stream and decode
+            stream = self._recognizer.create_stream()
+            stream.accept_waveform(self.sample_rate, audio_array)
+            self._recognizer.decode_streams([stream])
 
-            segments, info = self._model.transcribe(
-                audio_array,
-                language=self.language if self.language != "auto" else None,
-                beam_size=5,
-                vad_filter=True
-            )
-
-            text = " ".join([segment.text for segment in segments])
-
+            text = stream.result.text
             return ASRResult(
                 text=text,
                 is_final=True,
-                language=info.language if info.language else self.language,
-                confidence=info.language_probability
+                language="auto",
+                confidence=1.0 if text else 0.0
             )
-
         except Exception as e:
-            logger.error(f"Whisper recognition error: {e}")
-            raise ASRError(f"Whisper recognition failed: {e}")
+            logger.error(f"Sherpa-ONNX recognition error: {e}")
+            raise ASRError(f"Recognition failed: {e}")
 
     async def stream_audio(self, audio_stream: AsyncIterator[bytes]) -> AsyncIterator[ASRResult]:
         """Process streaming audio."""
         buffer = b""
-
         async for chunk in audio_stream:
             buffer += chunk
-
-            # Process in chunks
-            if len(buffer) > 16000 * 2:  # 1 second
+            # Process every 1 second of audio
+            if len(buffer) >= self.sample_rate * 2:
                 result = await self.recognize(buffer)
                 if result.text:
                     yield result
@@ -239,25 +258,26 @@ class FasterWhisperASR(BaseASR):
 
     async def close(self) -> None:
         """Close the ASR."""
-        self._model = None
+        self._recognizer = None
+        self._stream = None
 
 
-async def create_asr(config: Optional[dict] = None) -> MinimaxASR:
+async def create_asr(config: Optional[dict] = None) -> SherpaOnnxASR:
     """Factory function to create ASR instance."""
-    cfg = get_config()
-
-    if config and config.get("model_name") == "faster-whisper":
-        asr = FasterWhisperASR(
-            model_name=config.get("model_name", "small"),
-            language=config.get("language", "auto")
+    if config and config.get("model_name") == "minimax":
+        asr = MinimaxASR(
+            api_key=config.get("api_key", ""),
+            group_id=config.get("group_id", ""),
+            language=config.get("language", "auto"),
+            sample_rate=config.get("sample_rate", 16000)
+        )
+        return asr
+    else:
+        # Default to Sherpa-ONNX SenseVoice (local, fast)
+        asr = SherpaOnnxASR(
+            num_threads=4,
+            sample_rate=16000,
+            use_itn=True
         )
         await asr.load()
         return asr
-    else:
-        # Default to Minimax
-        return MinimaxASR(
-            api_key=cfg.api.minimax_api_key,
-            group_id=cfg.api.minimax_group_id,
-            language=cfg.asr.language,
-            sample_rate=cfg.asr.sample_rate
-        )

@@ -17,7 +17,7 @@ from ..orchestration.accumulator import ContextAccumulator, StubbornnessControll
 from ..orchestration.fsm import Event, State
 from ..orchestration.gatekeeper import RuleBasedGatekeeper
 from ..perception.vad import WebRTCVAD
-from ..perception.asr import MinimaxASR
+from ..perception.asr import SherpaOnnxASR
 
 logger = setup_logger("realtalk.web")
 
@@ -30,7 +30,7 @@ class RealTalkWebHandler:
         self._llm: Optional[OpenRouterLLM] = None
         self._tts: Optional[MinimaxTTS] = None
         self._vad: Optional[WebRTCVAD] = None
-        self._asr: Optional[MinimaxASR] = None
+        self._asr: Optional[SherpaOnnxASR] = None
         self._gatekeeper: Optional[RuleBasedGatekeeper] = None
         self._accumulator: Optional[ContextAccumulator] = None
         self._stubbornness: Optional[StubbornnessController] = None
@@ -53,10 +53,12 @@ class RealTalkWebHandler:
             group_id=cfg.api.minimax_group_id
         )
         self._vad = WebRTCVAD()
-        self._asr = MinimaxASR(
-            api_key=cfg.api.minimax_api_key,
-            group_id=cfg.api.minimax_group_id
+        self._asr = SherpaOnnxASR(
+            num_threads=4,
+            sample_rate=16000,
+            use_itn=True
         )
+        await self._asr.load()
         self._gatekeeper = RuleBasedGatekeeper()
         self._accumulator = ContextAccumulator()
         self._stubbornness = StubbornnessController(level=cfg.orchestration.stubbornness_level)
@@ -86,6 +88,7 @@ class RealTalkWebHandler:
     async def _handle_message(self, data: dict):
         """Handle incoming messages."""
         msg_type = data.get("type")
+        logger.info(f"Received message type: {msg_type}, data keys: {list(data.keys())}")
 
         if msg_type == "text":
             # User typed text - treat as user speech
@@ -113,19 +116,34 @@ class RealTalkWebHandler:
                 "message": "Context cleared"
             })
 
-        elif msg_type == "audio":
-            # Process audio from microphone
-            audio_data = data.get("data", "")
-            await self._process_audio(audio_data)
+        elif msg_type == "mic-audio-data":
+            # Process audio from microphone (float array from frontend VAD)
+            audio_array = data.get("audio", [])
+            logger.info(f"Received mic-audio-data, length: {len(audio_array)}")
+            await self._process_audio_float(audio_array)
+
+        elif msg_type == "mic-audio-end":
+            # User stopped speaking - process accumulated audio
+            logger.info("Received mic-audio-end")
+            await self._process_audio_end()
 
         elif msg_type == "audio_start":
             # User started speaking
+            logger.info("Received audio_start")
             self._current_state = State.LISTENING
             self._audio_buffer.clear()
             await self._send_to_client({"type": "state", "state": "listening"})
 
+        elif msg_type == "audio":
+            # Legacy: Process audio from microphone (base64)
+            audio_data = data.get("data", "")
+            is_speaking = data.get("isSpeaking", False)
+            logger.info(f"Received audio chunk, data length: {len(audio_data)}, isSpeaking: {is_speaking}")
+            await self._process_audio(audio_data)
+
         elif msg_type == "audio_end":
-            # User stopped speaking - process accumulated audio
+            # Legacy: User stopped speaking
+            logger.info("Received audio_end")
             await self._process_audio_end()
 
     async def _process_text(self, text: str):
@@ -166,10 +184,11 @@ class RealTalkWebHandler:
             })
 
     async def _process_audio(self, audio_base64: str):
-        """Process incoming audio chunk from browser."""
+        """Process incoming audio chunk from browser (legacy base64 format)."""
         try:
             # Decode base64 audio
             audio_bytes = base64.b64decode(audio_base64)
+            logger.info(f"Decoded audio chunk: {len(audio_bytes)} bytes, buffer size now: {len(self._audio_buffer) + 1}")
             self._audio_buffer.append(audio_bytes)
 
             # Convert to numpy for VAD
@@ -180,23 +199,44 @@ class RealTalkWebHandler:
 
             await self._send_to_client({
                 "type": "vad",
-                "is_speaking": vad_result.is_speaking,
-                "energy": vad_result.energy
+                "is_speaking": vad_result.is_speech,
+                "energy": vad_result.confidence
             })
         except Exception as e:
             logger.error(f"Error processing audio: {e}")
 
+    async def _process_audio_float(self, audio_list: list):
+        """Process incoming audio chunk from browser (float array from frontend VAD)."""
+        try:
+            # Convert float array to numpy and then to bytes
+            audio_array = np.array(audio_list, dtype=np.float32)
+            audio_bytes = (audio_array * 32767).astype(np.int16).tobytes()
+
+            logger.info(f"Processed float audio: {len(audio_bytes)} bytes, buffer size now: {len(self._audio_buffer) + 1}")
+            self._audio_buffer.append(audio_bytes)
+
+            # Frontend VAD handles speech detection, no need to run backend VAD
+        except Exception as e:
+            logger.error(f"Error processing float audio: {e}")
+
     async def _process_audio_end(self):
         """Process accumulated audio when user stops speaking."""
         if not self._audio_buffer:
+            logger.warning("No audio buffer to process")
+            await self._send_to_client({
+                "type": "status",
+                "message": "No audio recorded"
+            })
             return
 
         # Combine all audio chunks
         combined_audio = b"".join(self._audio_buffer)
+        logger.info(f"Processing audio: {len(combined_audio)} bytes, {len(self._audio_buffer)} chunks")
 
         # Run ASR
         try:
             asr_result = await self._asr.recognize(combined_audio)
+            logger.info(f"ASR result: '{asr_result.text}', is_final={asr_result.is_final}")
 
             if asr_result.text:
                 await self._send_to_client({
@@ -604,153 +644,97 @@ def get_index_html() -> str:
             }
         });
 
-        // Microphone audio capture
-        let mediaRecorder = null;
-        let audioChunks = [];
+        // Microphone audio capture with frontend VAD (like Open-LLM-VTuber)
         let isRecording = false;
         let audioContext = null;
-        let analyser = null;
         let micStream = null;
+        let processor = null;
+
+        // VAD state
+        let isSpeaking = false;
+        let silenceCount = 0;
+        let audioBuffer = [];
+        const SILENCE_THRESHOLD = 0.01;
+        const SILENCE_FRAMESneeded = 30;  // ~300ms at 100Hz
 
         async function toggleMic() {
             const btn = document.getElementById('micBtn');
 
             if (!isRecording) {
-                // Start recording with PCM capture and client-side VAD
                 try {
                     micStream = await navigator.mediaDevices.getUserMedia({ audio: {
                         sampleRate: 16000,
                         channelCount: 1,
-                        echoCancellation: true,
-                        noiseSuppression: true
+                        echoCancellation: false,
+                        noiseSuppression: false,
+                        autoGainControl: false
                     }});
 
-                    audioContext = new (window.AudioContext || window.webkitAudioContext)();
+                    audioContext = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 16000 });
+                    await audioContext.resume();
+
                     const source = audioContext.createMediaStreamSource(micStream);
+                    processor = audioContext.createScriptProcessor(4096, 1, 1);
 
-                    // Create script processor for PCM capture
-                    const bufferSize = 4096;
-                    const sampleRate = 16000;
+                    processor.onaudioprocess = (event) => {
+                        const inputBuffer = event.inputBuffer;
+                        const channelData = inputBuffer.getChannelData(0);
 
-                    // Use AudioWorklet if available, otherwise ScriptProcessor (deprecated but works)
-                    if (audioContext.audioWorklet) {
-                        // For simplicity, use ScriptProcessor here
-                        const processor = audioContext.createScriptProcessor(bufferSize, 1, 1);
+                        // Frontend VAD: calculate energy
+                        let sum = 0;
+                        for (let i = 0; i < channelData.length; i++) {
+                            sum += channelData[i] * channelData[i];
+                        }
+                        const rms = Math.sqrt(sum / channelData.length);
 
-                        let silenceCount = 0;
-                        const silenceThreshold = 0.01;
-                        const silenceFramesNeeded = 30; // ~2 seconds of silence to stop
-                        let isSpeaking = false;
-                        let audioBuffer = [];
+                        // Send audio data
+                        const audioArray = Array.from(channelData);
+                        if (ws && ws.readyState === WebSocket.OPEN) {
+                            ws.send(JSON.stringify({
+                                type: 'mic-audio-data',
+                                audio: audioArray
+                            }));
+                        }
 
-                        processor.onaudioprocess = (event) => {
-                            const inputData = event.inputBuffer.getChannelData(0);
-                            const outputData = event.outputBuffer.getChannelData(0);
-
-                            // Copy input to output
-                            outputData.set(inputData);
-
-                            // Calculate RMS
-                            let sum = 0;
-                            for (let i = 0; i < inputData.length; i++) {
-                                sum += inputData[i] * inputData[i];
-                            }
-                            const rms = Math.sqrt(sum / inputData.length);
-
-                            // Convert to 16-bit PCM
-                            const pcmData = new Int16Array(inputData.length);
-                            for (let i = 0; i < inputData.length; i++) {
-                                pcmData[i] = Math.max(-32768, Math.min(32767, Math.round(inputData[i] * 32767)));
-                            }
-
-                            // Send audio to server
-                            const bytes = new Uint8Array(pcmData.buffer);
-                            let binary = '';
-                            for (let i = 0; i < bytes.length; i++) {
-                                binary += String.fromCharCode(bytes[i]);
-                            }
-                            const base64 = btoa(binary);
-
-                            if (ws && ws.readyState === WebSocket.OPEN) {
-                                ws.send(JSON.stringify({
-                                    type: 'audio',
-                                    data: base64,
-                                    isSpeaking: rms > silenceThreshold
-                                }));
-                            }
-
-                            // VAD: detect silence
-                            if (rms > silenceThreshold) {
+                        // VAD logic
+                        if (rms > SILENCE_THRESHOLD) {
+                            if (!isSpeaking) {
                                 isSpeaking = true;
-                                silenceCount = 0;
-                                btn.style.background = '#00ff00';
-                            } else {
-                                silenceCount++;
-                                if (isSpeaking && silenceCount > silenceFramesNeeded) {
-                                    // Auto-stop recording after silence
-                                    stopRecording();
+                                console.log('Speech started');
+                                if (ws && ws.readyState === WebSocket.OPEN) {
+                                    ws.send(JSON.stringify({type: 'audio_start'}));
                                 }
-                                btn.style.background = '#ff4757';
                             }
-                        };
-
-                        source.connect(processor);
-                        processor.connect(audioContext.destination);
-
-                        // Store for cleanup
-                        mediaRecorder = processor;
-                        isRecording = true;
-                        btn.classList.add('recording');
-                        btn.textContent = '⏹';
-
-                        // Notify server
-                        if (ws && ws.readyState === WebSocket.OPEN) {
-                            ws.send(JSON.stringify({type: 'audio_start'}));
-                        }
-
-                    } else {
-                        // Fallback to MediaRecorder
-                        mediaRecorder = new MediaRecorder(micStream);
-                        audioChunks = [];
-
-                        mediaRecorder.ondataavailable = (event) => {
-                            if (event.data.size > 0) {
-                                audioChunks.push(event.data);
-                                const reader = new FileReader();
-                                reader.onload = () => {
-                                    const arrayBuffer = reader.result;
-                                    const uint8Array = new Uint8Array(arrayBuffer);
-                                    let binary = '';
-                                    for (let i = 0; i < uint8Array.length; i++) {
-                                        binary += String.fromCharCode(uint8Array[i]);
-                                    }
-                                    const base64 = btoa(binary);
+                            silenceCount = 0;
+                        } else {
+                            if (isSpeaking) {
+                                silenceCount++;
+                                if (silenceCount > SILENCE_FRAMESneeded) {
+                                    // Speech ended
+                                    isSpeaking = false;
+                                    silenceCount = 0;
+                                    console.log('Speech ended');
                                     if (ws && ws.readyState === WebSocket.OPEN) {
-                                        ws.send(JSON.stringify({type: 'audio', data: base64}));
+                                        ws.send(JSON.stringify({type: 'mic-audio-end'}));
                                     }
-                                };
-                                reader.readAsArrayBuffer(event.data);
+                                }
                             }
-                        };
-
-                        mediaRecorder.onstop = () => {
-                            if (ws && ws.readyState === WebSocket.OPEN) {
-                                ws.send(JSON.stringify({type: 'audio_end'}));
-                            }
-                        };
-
-                        mediaRecorder.start(100);
-                        isRecording = true;
-                        btn.classList.add('recording');
-                        btn.textContent = '⏹';
-
-                        if (ws && ws.readyState === WebSocket.OPEN) {
-                            ws.send(JSON.stringify({type: 'audio_start'}));
                         }
-                    }
+                    };
+
+                    // Don't connect to destination (avoid echo)
+                    source.connect(processor);
+
+                    isRecording = true;
+                    btn.classList.add('recording');
+                    btn.textContent = '⏹';
+                    btn.style.background = '#00ff00';
+
+                    addSystemMessage('Recording started...');
 
                 } catch (err) {
                     addSystemMessage('Microphone error: ' + err.message);
+                    console.error('Mic error:', err);
                 }
             } else {
                 stopRecording();
@@ -760,6 +744,10 @@ def get_index_html() -> str:
         function stopRecording() {
             const btn = document.getElementById('micBtn');
 
+            if (processor) {
+                processor.disconnect();
+                processor = null;
+            }
             if (micStream) {
                 micStream.getTracks().forEach(track => track.stop());
                 micStream = null;
@@ -768,25 +756,16 @@ def get_index_html() -> str:
                 audioContext.close();
                 audioContext = null;
             }
-            if (mediaRecorder) {
-                if (mediaRecorder instanceof AudioWorkletNode || mediaRecorder.onaudioprocess) {
-                    // Disconnect script processor
-                    mediaRecorder.disconnect();
-                } else if (mediaRecorder.state !== 'inactive') {
-                    mediaRecorder.stop();
-                }
-                mediaRecorder = null;
-            }
 
             isRecording = false;
+            isSpeaking = false;
+            silenceCount = 0;
+
             btn.classList.remove('recording');
             btn.textContent = '🎤';
             btn.style.background = '#ff4757';
 
-            // Notify server recording ended
-            if (ws && ws.readyState === WebSocket.OPEN) {
-                ws.send(JSON.stringify({type: 'audio_end'}));
-            }
+            addSystemMessage('Recording stopped');
         }
 
         connect();
