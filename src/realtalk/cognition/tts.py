@@ -123,9 +123,9 @@ class MinimaxTTS(BaseTTS):
 
                 if "data" in result and "audio" in result["data"]:
                     audio_data = result["data"]["audio"]
-                    # Note: API returns raw binary, not base64 encoded
+                    # Note: API returns hex-encoded string
                     if isinstance(audio_data, str):
-                        audio_data = audio_data.encode('latin-1')  # Convert to bytes
+                        audio_data = bytes.fromhex(audio_data)  # Decode hex string
                     logger.info(f"TTS audio field type: {type(audio_data)}, length: {len(audio_data) if audio_data else 0}")
 
                     # Debug: save audio to file
@@ -246,9 +246,9 @@ class MinimaxTTS(BaseTTS):
 
                             if "data" in data and "audio" in data["data"]:
                                 audio_data = data["data"]["audio"]
-                                # Note: API returns raw binary, not base64 encoded
+                                # Note: API returns hex-encoded string
                                 if isinstance(audio_data, str):
-                                    audio_data = audio_data.encode('latin-1')  # Convert to bytes
+                                    audio_data = bytes.fromhex(audio_data)  # Decode hex string
                                 logger.info(f"TTS audio field type: {type(audio_data)}, length: {len(audio_data) if audio_data else 0}")
                                 is_final = data.get("is_final", False)
 
