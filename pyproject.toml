@@ -9,10 +9,14 @@ dependencies = [
     "websockets>=12.0",
     "python-dotenv>=1.0.0",
     "pydantic>=2.5.0",
+    "pydantic-settings>=2.0.0",
     "numpy>=1.24.0",
     "webrtc-noise-gain>=1.2.3",
     "soundfile>=0.12.1",
 ]
+
+[project.scripts]
+realtalk = "realtalk.web.server:run_server"
 
 [project.optional-dependencies]
 dev = [
