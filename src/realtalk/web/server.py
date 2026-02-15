@@ -499,7 +499,7 @@ def get_index_html() -> str:
 """
 
 
-async def run_server(host: str = "0.0.0.0", port: int = 8080):
+async def run_server(host: str = "localhost", port: int = 8080):
     """Run the web server."""
     app = await create_app()
     logger.info(f"Starting server on {host}:{port}")
@@ -508,8 +508,20 @@ async def run_server(host: str = "0.0.0.0", port: int = 8080):
     site = web.TCPSite(runner, host, port)
     await site.start()
     logger.info(f"Server running at http://{host}:{port}")
-    return runner
+
+    # Keep server running
+    try:
+        while True:
+            await asyncio.sleep(3600)
+    except asyncio.CancelledError:
+        logger.info("Server shutting down")
+        await runner.cleanup()
+
+
+def main():
+    """CLI entry point."""
+    asyncio.run(run_server())
 
 
 if __name__ == "__main__":
-    asyncio.run(run_server())
+    main()

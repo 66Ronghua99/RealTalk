@@ -16,7 +16,7 @@ dependencies = [
 ]
 
 [project.scripts]
-realtalk = "realtalk.web.server:run_server"
+realtalk = "realtalk.web.server:main"
 
 [project.optional-dependencies]
 dev = [
