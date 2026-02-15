@@ -13,10 +13,15 @@ dependencies = [
     "numpy>=1.24.0",
     "webrtc-noise-gain>=1.2.3",
     "soundfile>=0.12.1",
+    "sounddevice>=0.4.0",
+    "sherpa-onnx>=1.10.0",
+    "uvicorn>=0.40.0",
+    "hupper>=1.12.1",
 ]
 
 [project.scripts]
 realtalk = "realtalk.web.server:main"
+realtalk-cli = "realtalk.cli:main"
 
 [project.optional-dependencies]
 dev = [

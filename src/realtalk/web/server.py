@@ -9,7 +9,7 @@ import aiohttp
 from aiohttp import web
 import numpy as np
 
-from ..cognition.llm import OpenRouterLLM
+from ..cognition.llm import OpenRouterLLM, Message
 from ..cognition.tts import MinimaxTTS
 from ..config import get_config
 from ..logging_config import setup_logger
@@ -88,7 +88,7 @@ class RealTalkWebHandler:
     async def _handle_message(self, data: dict):
         """Handle incoming messages."""
         msg_type = data.get("type")
-        logger.info(f"Received message type: {msg_type}, data keys: {list(data.keys())}")
+        # logger.info(f"Received message type: {msg_type}, data keys: {list(data.keys())}")
 
         if msg_type == "text":
             # User typed text - treat as user speech
@@ -119,7 +119,7 @@ class RealTalkWebHandler:
         elif msg_type == "mic-audio-data":
             # Process audio from microphone (float array from frontend VAD)
             audio_array = data.get("audio", [])
-            logger.info(f"Received mic-audio-data, length: {len(audio_array)}")
+            # logger.info(f"Received mic-audio-data, length: {len(audio_array)}, first 3 values: {audio_array[:3] if audio_array else []}")
             await self._process_audio_float(audio_array)
 
         elif msg_type == "mic-audio-end":
@@ -138,7 +138,7 @@ class RealTalkWebHandler:
             # Legacy: Process audio from microphone (base64)
             audio_data = data.get("data", "")
             is_speaking = data.get("isSpeaking", False)
-            logger.info(f"Received audio chunk, data length: {len(audio_data)}, isSpeaking: {is_speaking}")
+            # logger.info(f"Received audio chunk, data length: {len(audio_data)}, isSpeaking: {is_speaking}")
             await self._process_audio(audio_data)
 
         elif msg_type == "audio_end":
@@ -188,7 +188,7 @@ class RealTalkWebHandler:
         try:
             # Decode base64 audio
             audio_bytes = base64.b64decode(audio_base64)
-            logger.info(f"Decoded audio chunk: {len(audio_bytes)} bytes, buffer size now: {len(self._audio_buffer) + 1}")
+            # logger.info(f"Decoded audio chunk: {len(audio_bytes)} bytes, buffer size now: {len(self._audio_buffer) + 1}")
             self._audio_buffer.append(audio_bytes)
 
             # Convert to numpy for VAD
@@ -212,7 +212,7 @@ class RealTalkWebHandler:
             audio_array = np.array(audio_list, dtype=np.float32)
             audio_bytes = (audio_array * 32767).astype(np.int16).tobytes()
 
-            logger.info(f"Processed float audio: {len(audio_bytes)} bytes, buffer size now: {len(self._audio_buffer) + 1}")
+            # logger.info(f"Processed float audio: {len(audio_bytes)} bytes, buffer size now: {len(self._audio_buffer) + 1}")
             self._audio_buffer.append(audio_bytes)
 
             # Frontend VAD handles speech detection, no need to run backend VAD
@@ -239,11 +239,6 @@ class RealTalkWebHandler:
             logger.info(f"ASR result: '{asr_result.text}', is_final={asr_result.is_final}")
 
             if asr_result.text:
-                await self._send_to_client({
-                    "type": "transcript",
-                    "text": asr_result.text,
-                    "is_final": True
-                })
                 await self._process_text(asr_result.text)
             else:
                 await self._send_to_client({
@@ -273,8 +268,8 @@ class RealTalkWebHandler:
 
         # Build messages
         messages = [
-            {"role": "system", "content": "You are a helpful and conversational AI assistant."},
-            {"role": "user", "content": context}
+            Message(role="system", content="You are a helpful and conversational AI assistant."),
+            Message(role="user", content=context)
         ]
 
         # Stream LLM response
@@ -291,14 +286,27 @@ class RealTalkWebHandler:
         self._is_speaking = True
         await self._send_to_client({"type": "state", "state": "speaking"})
 
-        async for tts_result in self._tts.stream_synthesize(response_text):
-            if tts_result.audio:
-                import base64
-                audio_b64 = base64.b64encode(tts_result.audio).decode()
-                await self._send_to_client({
-                    "type": "tts_audio",
-                    "audio": audio_b64
-                })
+        logger.info(f"Starting TTS for text: {response_text[:50]}...")
+        try:
+            chunk_count = 0
+            async for tts_result in self._tts.stream_synthesize(response_text):
+                logger.info(f"TTS result: audio={tts_result.audio is not None}, is_final={tts_result.is_final}")
+                if tts_result.audio:
+                    chunk_count += 1
+                    logger.info(f"TTS audio chunk {chunk_count}: {len(tts_result.audio)} bytes")
+                    import base64
+                    audio_b64 = base64.b64encode(tts_result.audio).decode()
+                    await self._send_to_client({
+                        "type": "tts_audio",
+                        "audio": audio_b64
+                    })
+            logger.info(f"TTS complete, total chunks: {chunk_count}")
+        except Exception as e:
+            logger.error(f"TTS error: {e}", exc_info=True)
+            await self._send_to_client({
+                "type": "status",
+                "message": f"TTS error: {e}"
+            })
 
         self._current_state = State.LISTENING
         self._is_speaking = False
@@ -334,7 +342,7 @@ class RealTalkWebHandler:
 
 
 async def create_app() -> web.Application:
-    """Create aiohttp application."""
+    """Create aiohttp application (async version for manual use)."""
     handler = RealTalkWebHandler()
     await handler.init()
 
@@ -356,6 +364,17 @@ async def create_app() -> web.Application:
 
     app.router.add_get("/", index)
 
+    return app
+
+
+def create_app_sync() -> web.Application:
+    """Create aiohttp application (sync version for uvicorn)."""
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    try:
+        app = loop.run_until_complete(create_app())
+    finally:
+        loop.close()
     return app
 
 
@@ -550,7 +569,14 @@ def get_index_html() -> str:
                     addMessage(data.text, 'user');
                     break;
                 case 'llm_chunk':
-                    // Could stream LLM response
+                    // Stream LLM response to display (update last message)
+                    const chat = document.getElementById('chat');
+                    const messages = chat.querySelectorAll('.message.assistant');
+                    if (messages.length > 0) {
+                        messages[messages.length - 1].textContent = data.text;
+                    } else {
+                        addMessage(data.text, 'assistant');
+                    }
                     break;
                 case 'tts_audio':
                     // Play audio
@@ -655,7 +681,7 @@ def get_index_html() -> str:
         let silenceCount = 0;
         let audioBuffer = [];
         const SILENCE_THRESHOLD = 0.01;
-        const SILENCE_FRAMESneeded = 30;  // ~300ms at 100Hz
+        const SILENCE_FRAMESneeded = 5;  // ~1.3s at 5 frames
 
         async function toggleMic() {
             const btn = document.getElementById('micBtn');
@@ -687,13 +713,20 @@ def get_index_html() -> str:
                         }
                         const rms = Math.sqrt(sum / channelData.length);
 
+                        // DEBUG: Log WS state
+                        const wsState = ws ? ws.readyState : 'null';
+                        console.log('onaudioprocess: ws.readyState=', wsState, 'rms=', rms.toFixed(4));
+
                         // Send audio data
                         const audioArray = Array.from(channelData);
                         if (ws && ws.readyState === WebSocket.OPEN) {
+                            console.log('Sending mic-audio-data, length=', audioArray.length);
                             ws.send(JSON.stringify({
                                 type: 'mic-audio-data',
                                 audio: audioArray
                             }));
+                        } else {
+                            console.warn('WebSocket not open, state:', wsState);
                         }
 
                         // VAD logic
@@ -722,8 +755,12 @@ def get_index_html() -> str:
                         }
                     };
 
-                    // Don't connect to destination (avoid echo)
+                    // Connect processor to enable callback (with gain=0 to prevent echo)
                     source.connect(processor);
+                    const dummy = audioContext.createGain();
+                    dummy.gain.value = 0;
+                    processor.connect(dummy);
+                    dummy.connect(audioContext.destination);
 
                     isRecording = true;
                     btn.classList.add('recording');
@@ -796,7 +833,7 @@ async def run_server(host: str = "localhost", port: int = 8080):
 
 def main():
     """CLI entry point."""
-    asyncio.run(run_server())
+    asyncio.run(run_server(), debug=True)
 
 
 if __name__ == "__main__":

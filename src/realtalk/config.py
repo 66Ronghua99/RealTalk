@@ -32,7 +32,7 @@ class ASRConfig(BaseModel):
 
 class LLMConfig(BaseModel):
     """LLM configuration."""
-    model_name: str = "google/gemini-3-flash-preview-0520"
+    model_name: str = "google/gemini-2.5-flash"
     temperature: float = 0.7
     max_tokens: int = 1024
 
@@ -47,7 +47,7 @@ class TTSConfig(BaseModel):
 class OrchestrationConfig(BaseModel):
     """Orchestration configuration."""
     wait_threshold_ms: int = 300
-    reply_threshold_ms: int = 500
+    reply_threshold_ms: int = 400
     accumulate_threshold_ms: int = 1500
     stubbornness_level: int = 50  # 0-100
 
