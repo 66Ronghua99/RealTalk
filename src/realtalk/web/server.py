@@ -464,6 +464,8 @@ def get_index_html() -> str:
         .btn-send:hover { background: #00b8d4; }
         .btn-interrupt { background: #ff4757; color: #fff; }
         .btn-interrupt:hover { background: #ff3344; }
+        .btn-test { background: #ffa500; color: #000; }
+        .btn-test:hover { background: #ff8c00; }
         .controls {
             display: flex;
             gap: 10px;
@@ -529,6 +531,7 @@ def get_index_html() -> str:
             <div class="control-group">
                 <button class="btn-interrupt" onclick="interrupt()">Interrupt</button>
                 <button onclick="clearContext()">Clear Context</button>
+                <button class="btn-test" onclick="testAudio()">Test Audio</button>
             </div>
         </div>
 
@@ -579,16 +582,60 @@ def get_index_html() -> str:
                     }
                     break;
                 case 'tts_audio':
-                    // Play audio
+                    // Play audio using Web Audio API
                     if (data.audio) {
-                        const audioData = atob(data.audio);
-                        const arrayBuffer = new ArrayBuffer(audioData.length);
-                        const uint8Array = new Uint8Array(arrayBuffer);
-                        for (let i = 0; i < audioData.length; i++) {
-                            uint8Array[i] = audioData.charCodeAt(i);
+                        console.log('Received tts_audio, length:', data.audio.length);
+                        addSystemMessage('Playing TTS audio...');
+                        try {
+                            // Decode base64 to binary
+                            const binaryString = atob(data.audio);
+                            const bytes = new Uint8Array(binaryString.length);
+                            for (let i = 0; i < binaryString.length; i++) {
+                                bytes[i] = binaryString.charCodeAt(i);
+                            }
+
+                            // Log WAV header for debugging - show hex dump
+                            let hexDump = '';
+                            for (let i = 0; i < Math.min(64, bytes.length); i++) {
+                                hexDump += bytes[i].toString(16).padStart(2, '0') + ' ';
+                            }
+                            console.log('WAV hex dump (first 64 bytes):', hexDump);
+
+                            const view = new DataView(bytes.buffer);
+                            const riff = String.fromCharCode(bytes[0], bytes[1], bytes[2], bytes[3]);
+                            const wave = String.fromCharCode(bytes[8], bytes[9], bytes[10], bytes[11]);
+                            const fmt = String.fromCharCode(bytes[12], bytes[13], bytes[14], bytes[15]);
+                            const channels = view.getUint16(22, true);
+                            const sampleRate = view.getUint16(24, true);
+                            console.log('WAV header - RIFF:', riff, 'WAVE:', wave, 'fmt:', fmt, 'channels:', channels, 'sampleRate:', sampleRate);
+
+                            // Create audio context
+                            const audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+                            console.log('AudioContext sampleRate:', audioCtx.sampleRate);
+
+                            // Decode the WAV audio
+                            audioCtx.decodeAudioData(bytes.buffer).then(audioBuffer => {
+                                console.log('Audio decoded, duration:', audioBuffer.duration, 'samples:', audioBuffer.length, 'channels:', audioBuffer.numberOfChannels);
+
+                                // Play the audio
+                                const source = audioCtx.createBufferSource();
+                                source.buffer = audioBuffer;
+                                source.connect(audioCtx.destination);
+                                source.start(0);
+                                console.log('Audio playing');
+
+                                source.onended = () => {
+                                    console.log('Audio playback finished');
+                                    addSystemMessage('TTS audio finished!');
+                                };
+                            }).catch(err => {
+                                console.error('Decode error:', err);
+                                addSystemMessage('Decode error: ' + err.message);
+                            });
+                        } catch (e) {
+                            console.error('TTS audio error:', e);
+                            addSystemMessage('TTS error: ' + e.message);
                         }
-                        const audio = new Audio(URL.createObjectURL(new Blob([uint8Array], {type: 'audio/wav'})));
-                        audio.play();
                     }
                     break;
                 case 'state':
@@ -638,6 +685,54 @@ def get_index_html() -> str:
             ws.send(JSON.stringify({type: 'clear'}));
             accumulatedCount = 0;
             document.getElementById('accumulated').textContent = '0';
+        }
+
+        // Test audio playback using Web Audio API
+        function testAudio() {
+            console.log('Testing audio playback...');
+            addSystemMessage('Testing audio playback...');
+
+            try {
+                // Create audio context
+                const audioContext = new (window.AudioContext || window.webkitAudioContext)();
+
+                // Generate a simple 440Hz sine wave (A note)
+                const sampleRate = audioContext.sampleRate;
+                const duration = 1.0; // 1 second
+                const frequency = 440;
+                const numSamples = sampleRate * duration;
+                const audioBuffer = audioContext.createBuffer(1, numSamples, sampleRate);
+                const channelData = audioBuffer.getChannelData(0);
+
+                // Generate sine wave with fade in/out
+                for (let i = 0; i < numSamples; i++) {
+                    const t = i / sampleRate;
+                    // Apply envelope (fade in/out)
+                    let envelope = 1;
+                    if (i < sampleRate * 0.1) {
+                        envelope = i / (sampleRate * 0.1);
+                    } else if (i > numSamples - sampleRate * 0.1) {
+                        envelope = (numSamples - i) / (sampleRate * 0.1);
+                    }
+                    channelData[i] = Math.sin(2 * Math.PI * frequency * t) * 0.5 * envelope;
+                }
+
+                // Play the audio
+                const source = audioContext.createBufferSource();
+                source.buffer = audioBuffer;
+                source.connect(audioContext.destination);
+
+                source.onended = () => {
+                    console.log('Test audio played successfully!');
+                    addSystemMessage('Test audio played! Did you hear the sound?');
+                };
+
+                source.start(0);
+                console.log('Test audio started');
+            } catch (e) {
+                console.error('Test audio error:', e);
+                addSystemMessage('Test audio error: ' + e.message);
+            }
         }
 
         function handleKeyPress(e) {
@@ -715,12 +810,12 @@ def get_index_html() -> str:
 
                         // DEBUG: Log WS state
                         const wsState = ws ? ws.readyState : 'null';
-                        console.log('onaudioprocess: ws.readyState=', wsState, 'rms=', rms.toFixed(4));
+                        // console.log('onaudioprocess: ws.readyState=', wsState, 'rms=', rms.toFixed(4));
 
                         // Send audio data
                         const audioArray = Array.from(channelData);
                         if (ws && ws.readyState === WebSocket.OPEN) {
-                            console.log('Sending mic-audio-data, length=', audioArray.length);
+                            // console.log('Sending mic-audio-data, length=', audioArray.length);
                             ws.send(JSON.stringify({
                                 type: 'mic-audio-data',
                                 audio: audioArray

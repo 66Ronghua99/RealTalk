@@ -1,10 +1,7 @@
 """Text-to-Speech (TTS) module using Minimax API."""
 import asyncio
 import base64
-import hashlib
-import hmac
 import json
-import time
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from typing import AsyncIterator, Optional
@@ -67,9 +64,11 @@ class MinimaxTTS(BaseTTS):
         self.voice_id = voice_id
         self.sample_rate = sample_rate
         self._session: Optional[aiohttp.ClientSession] = None
-        self._base_url = "https://api.minimax.chat/v1"
+        self._base_url = "https://api.minimaxi.com/v1"
         self._current_task: Optional[asyncio.Task] = None
         self._stop_event = asyncio.Event()
+
+        logger.info(f"MinimaxTTS initialized: group_id={group_id}, voice_id={voice_id}, sample_rate={sample_rate}")
 
     async def _get_session(self) -> aiohttp.ClientSession:
         """Get or create HTTP session."""
@@ -77,42 +76,32 @@ class MinimaxTTS(BaseTTS):
             self._session = aiohttp.ClientSession()
         return self._session
 
-    def _generate_signature(self, timestamp: int) -> str:
-        """Generate API signature."""
-        message = f"{self.group_id}{timestamp}"
-        signature = hmac.new(
-            self.api_key.encode(),
-            message.encode(),
-            hashlib.sha256
-        ).digest()
-        return base64.b64encode(signature).decode()
-
     async def synthesize(self, text: str) -> TTSResult:
         """Synthesize speech from text."""
-        timestamp = int(time.time())
-        signature = self._generate_signature(timestamp)
-
         url = f"{self._base_url}/t2a_v2"
 
         headers = {
-            "Authorization": f"Bearer; {signature}",
+            "Authorization": f"Bearer {self.api_key}",
             "Content-Type": "application/json",
-            "Accept": "application/json, text/event-stream",
         }
 
         payload = {
-            "model": "speech-01-turbo",
-            "group_id": self.group_id,
-            "timestamp": timestamp,
+            "model": "speech-2.8-hd",
             "text": text,
+            "stream": False,
             "voice_setting": {
                 "voice_id": self.voice_id,
+                "speed": 1,
+                "vol": 1,
+                "pitch": 0,
             },
             "audio_setting": {
                 "sample_rate": self.sample_rate,
                 "bitrate": 128000,
-                "format": "wav",
+                "format": "mp3",
+                "channel": 1
             },
+            "subtitle_enable": False,
         }
 
         try:
@@ -124,10 +113,26 @@ class MinimaxTTS(BaseTTS):
                     raise TTSError(f"TTS API error: {response.status}")
 
                 result = await response.json()
+                logger.info(f"TTS response keys: {result.keys()}")
+
+                # Check for API error
+                if "base_resp" in result and result["base_resp"].get("status_code") != 0:
+                    error_msg = result["base_resp"].get("status_msg", "Unknown error")
+                    logger.error(f"TTS API error: {error_msg}")
+                    raise TTSError(f"TTS API error: {error_msg}")
 
                 if "data" in result and "audio" in result["data"]:
-                    audio_base64 = result["data"]["audio"]
-                    audio_data = base64.b64decode(audio_base64)
+                    audio_data = result["data"]["audio"]
+                    # Note: API returns raw binary, not base64 encoded
+                    if isinstance(audio_data, str):
+                        audio_data = audio_data.encode('latin-1')  # Convert to bytes
+                    logger.info(f"TTS audio field type: {type(audio_data)}, length: {len(audio_data) if audio_data else 0}")
+
+                    # Debug: save audio to file
+                    debug_path = "/Users/cory/codes/RealTalk/debug_tts.mp3"
+                    with open(debug_path, "wb") as f:
+                        f.write(audio_data)
+                    logger.info(f"TTS audio saved to {debug_path}, size: {len(audio_data)} bytes")
 
                     return TTSResult(
                         audio=audio_data,
@@ -152,30 +157,30 @@ class MinimaxTTS(BaseTTS):
 
     async def stream_synthesize(self, text: str) -> AsyncIterator[TTSResult]:
         """Synthesize speech with streaming output."""
-        timestamp = int(time.time())
-        signature = self._generate_signature(timestamp)
-
         url = f"{self._base_url}/t2a_v2"
 
         headers = {
-            "Authorization": f"Bearer; {signature}",
+            "Authorization": f"Bearer {self.api_key}",
             "Content-Type": "application/json",
-            "Accept": "text/event-stream",
         }
 
         payload = {
-            "model": "speech-01-turbo",
-            "group_id": self.group_id,
-            "timestamp": timestamp,
+            "model": "speech-2.8-hd",
             "text": text,
+            "stream": True,
             "voice_setting": {
                 "voice_id": self.voice_id,
+                "speed": 1,
+                "vol": 1,
+                "pitch": 0,
             },
             "audio_setting": {
                 "sample_rate": self.sample_rate,
                 "bitrate": 128000,
-                "format": "wav",
+                "format": "mp3",
+                "channel": 1
             },
+            "subtitle_enable": False,
         }
 
         try:
@@ -186,25 +191,65 @@ class MinimaxTTS(BaseTTS):
                     logger.error(f"TTS stream error: {response.status} - {error_text}")
                     return
 
+                logger.info(f"TTS API response status: {response.status}")
+                logger.info(f"TTS Content-Type: {response.headers.get('Content-Type', 'unknown')}")
+
                 # Read streaming response
-                async for line in response.content:
+                content_bytes = await response.read()
+                logger.info(f"TTS response length: {len(content_bytes)} bytes")
+                logger.info(f"TTS response (first 500): {content_bytes[:500]}")
+
+                # Check if it's JSON instead of SSE
+                try:
+                    data = json.loads(content_bytes)
+                    logger.info(f"TTS response is JSON: {data.keys()}")
+                    # Handle non-streaming response
+                    if "data" in data and "audio" in data["data"]:
+                        audio_base64 = data["data"]["audio"]
+                        audio_data = base64.b64decode(audio_base64)
+                        yield TTSResult(
+                            audio=audio_data,
+                            sample_rate=self.sample_rate,
+                            is_final=True,
+                            text=text
+                        )
+                    return
+                except json.JSONDecodeError:
+                    pass
+
+                # Parse as SSE
+                for line_str in content_bytes.decode().split('\n'):
                     if self._stop_event.is_set():
                         break
 
-                    line = line.decode().strip()
-                    if not line:
+                    line_str = line_str.strip()
+                    if not line_str:
                         continue
 
-                    if line.startswith("data: "):
-                        data_str = line[6:]
+                    logger.debug(f"TTS line: {line_str[:100]}...")
+
+                    if line_str.startswith("data: "):
+                        data_str = line_str[6:]
                         if data_str == "[DONE]":
+                            logger.info("TTS stream done")
                             break
 
                         try:
                             data = json.loads(data_str)
+                            logger.info(f"TTS data keys: {data.keys()}")
+
+                            # Check for API error
+                            if "base_resp" in data and data["base_resp"].get("status_code") != 0:
+                                error_msg = data["base_resp"].get("status_msg", "Unknown error")
+                                logger.error(f"TTS API error: {error_msg}")
+                                raise TTSError(f"TTS API error: {error_msg}")
+
                             if "data" in data and "audio" in data["data"]:
-                                audio_base64 = data["data"]["audio"]
-                                audio_data = base64.b64decode(audio_base64)
+                                audio_data = data["data"]["audio"]
+                                # Note: API returns raw binary, not base64 encoded
+                                if isinstance(audio_data, str):
+                                    audio_data = audio_data.encode('latin-1')  # Convert to bytes
+                                logger.info(f"TTS audio field type: {type(audio_data)}, length: {len(audio_data) if audio_data else 0}")
                                 is_final = data.get("is_final", False)
 
                                 yield TTSResult(
@@ -213,7 +258,10 @@ class MinimaxTTS(BaseTTS):
                                     is_final=is_final,
                                     text=text
                                 )
-                        except json.JSONDecodeError:
+                            else:
+                                logger.warning(f"TTS data format unexpected: {data}")
+                        except json.JSONDecodeError as e:
+                            logger.warning(f"TTS JSON decode error: {e}")
                             continue
 
         except asyncio.CancelledError:
