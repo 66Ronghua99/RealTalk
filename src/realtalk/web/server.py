@@ -616,86 +616,176 @@ def get_index_html() -> str:
             const btn = document.getElementById('micBtn');
 
             if (!isRecording) {
-                // Start recording
+                // Start recording with PCM capture and client-side VAD
                 try {
-                    micStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+                    micStream = await navigator.mediaDevices.getUserMedia({ audio: {
+                        sampleRate: 16000,
+                        channelCount: 1,
+                        echoCancellation: true,
+                        noiseSuppression: true
+                    }});
 
                     audioContext = new (window.AudioContext || window.webkitAudioContext)();
-                    analyser = audioContext.createAnalyser();
                     const source = audioContext.createMediaStreamSource(micStream);
-                    source.connect(analyser);
-                    analyser.fftSize = 256;
 
-                    mediaRecorder = new MediaRecorder(micStream);
-                    audioChunks = [];
+                    // Create script processor for PCM capture
+                    const bufferSize = 4096;
+                    const sampleRate = 16000;
 
-                    mediaRecorder.ondataavailable = (event) => {
-                        if (event.data.size > 0) {
-                            audioChunks.push(event.data);
+                    // Use AudioWorklet if available, otherwise ScriptProcessor (deprecated but works)
+                    if (audioContext.audioWorklet) {
+                        // For simplicity, use ScriptProcessor here
+                        const processor = audioContext.createScriptProcessor(bufferSize, 1, 1);
 
-                            // Send audio chunk to server while recording
-                            const reader = new FileReader();
-                            reader.onload = () => {
-                                const arrayBuffer = reader.result;
-                                const uint8Array = new Uint8Array(arrayBuffer);
-                                let binary = '';
-                                for (let i = 0; i < uint8Array.length; i++) {
-                                    binary += String.fromCharCode(uint8Array[i]);
+                        let silenceCount = 0;
+                        const silenceThreshold = 0.01;
+                        const silenceFramesNeeded = 30; // ~2 seconds of silence to stop
+                        let isSpeaking = false;
+                        let audioBuffer = [];
+
+                        processor.onaudioprocess = (event) => {
+                            const inputData = event.inputBuffer.getChannelData(0);
+                            const outputData = event.outputBuffer.getChannelData(0);
+
+                            // Copy input to output
+                            outputData.set(inputData);
+
+                            // Calculate RMS
+                            let sum = 0;
+                            for (let i = 0; i < inputData.length; i++) {
+                                sum += inputData[i] * inputData[i];
+                            }
+                            const rms = Math.sqrt(sum / inputData.length);
+
+                            // Convert to 16-bit PCM
+                            const pcmData = new Int16Array(inputData.length);
+                            for (let i = 0; i < inputData.length; i++) {
+                                pcmData[i] = Math.max(-32768, Math.min(32767, Math.round(inputData[i] * 32767)));
+                            }
+
+                            // Send audio to server
+                            const bytes = new Uint8Array(pcmData.buffer);
+                            let binary = '';
+                            for (let i = 0; i < bytes.length; i++) {
+                                binary += String.fromCharCode(bytes[i]);
+                            }
+                            const base64 = btoa(binary);
+
+                            if (ws && ws.readyState === WebSocket.OPEN) {
+                                ws.send(JSON.stringify({
+                                    type: 'audio',
+                                    data: base64,
+                                    isSpeaking: rms > silenceThreshold
+                                }));
+                            }
+
+                            // VAD: detect silence
+                            if (rms > silenceThreshold) {
+                                isSpeaking = true;
+                                silenceCount = 0;
+                                btn.style.background = '#00ff00';
+                            } else {
+                                silenceCount++;
+                                if (isSpeaking && silenceCount > silenceFramesNeeded) {
+                                    // Auto-stop recording after silence
+                                    stopRecording();
                                 }
-                                const base64 = btoa(binary);
-                                if (ws && ws.readyState === WebSocket.OPEN) {
-                                    ws.send(JSON.stringify({type: 'audio', data: base64}));
-                                }
-                            };
-                            reader.readAsArrayBuffer(event.data);
-                        }
-                    };
+                                btn.style.background = '#ff4757';
+                            }
+                        };
 
-                    mediaRecorder.onstop = async () => {
-                        const audioBlob = new Blob(audioChunks, { type: 'audio/webm' });
-                        const arrayBuffer = await audioBlob.arrayBuffer();
-                        const uint8Array = new Uint8Array(arrayBuffer);
+                        source.connect(processor);
+                        processor.connect(audioContext.destination);
 
-                        // Convert to base64
-                        let binary = '';
-                        for (let i = 0; i < uint8Array.length; i++) {
-                            binary += String.fromCharCode(uint8Array[i]);
+                        // Store for cleanup
+                        mediaRecorder = processor;
+                        isRecording = true;
+                        btn.classList.add('recording');
+                        btn.textContent = '⏹';
+
+                        // Notify server
+                        if (ws && ws.readyState === WebSocket.OPEN) {
+                            ws.send(JSON.stringify({type: 'audio_start'}));
                         }
-                        const base64 = btoa(binary);
+
+                    } else {
+                        // Fallback to MediaRecorder
+                        mediaRecorder = new MediaRecorder(micStream);
+                        audioChunks = [];
+
+                        mediaRecorder.ondataavailable = (event) => {
+                            if (event.data.size > 0) {
+                                audioChunks.push(event.data);
+                                const reader = new FileReader();
+                                reader.onload = () => {
+                                    const arrayBuffer = reader.result;
+                                    const uint8Array = new Uint8Array(arrayBuffer);
+                                    let binary = '';
+                                    for (let i = 0; i < uint8Array.length; i++) {
+                                        binary += String.fromCharCode(uint8Array[i]);
+                                    }
+                                    const base64 = btoa(binary);
+                                    if (ws && ws.readyState === WebSocket.OPEN) {
+                                        ws.send(JSON.stringify({type: 'audio', data: base64}));
+                                    }
+                                };
+                                reader.readAsArrayBuffer(event.data);
+                            }
+                        };
+
+                        mediaRecorder.onstop = () => {
+                            if (ws && ws.readyState === WebSocket.OPEN) {
+                                ws.send(JSON.stringify({type: 'audio_end'}));
+                            }
+                        };
+
+                        mediaRecorder.start(100);
+                        isRecording = true;
+                        btn.classList.add('recording');
+                        btn.textContent = '⏹';
 
                         if (ws && ws.readyState === WebSocket.OPEN) {
-                            ws.send(JSON.stringify({type: 'audio_end', data: base64}));
+                            ws.send(JSON.stringify({type: 'audio_start'}));
                         }
-                    };
-
-                    mediaRecorder.start(100); // Send chunks every 100ms
-                    isRecording = true;
-                    btn.classList.add('recording');
-                    btn.textContent = '⏹';
-
-                    // Notify server recording started
-                    if (ws && ws.readyState === WebSocket.OPEN) {
-                        ws.send(JSON.stringify({type: 'audio_start'}));
                     }
 
                 } catch (err) {
                     addSystemMessage('Microphone error: ' + err.message);
                 }
             } else {
-                // Stop recording
-                if (mediaRecorder && mediaRecorder.state !== 'inactive') {
+                stopRecording();
+            }
+        }
+
+        function stopRecording() {
+            const btn = document.getElementById('micBtn');
+
+            if (micStream) {
+                micStream.getTracks().forEach(track => track.stop());
+                micStream = null;
+            }
+            if (audioContext) {
+                audioContext.close();
+                audioContext = null;
+            }
+            if (mediaRecorder) {
+                if (mediaRecorder instanceof AudioWorkletNode || mediaRecorder.onaudioprocess) {
+                    // Disconnect script processor
+                    mediaRecorder.disconnect();
+                } else if (mediaRecorder.state !== 'inactive') {
                     mediaRecorder.stop();
                 }
-                if (micStream) {
-                    micStream.getTracks().forEach(track => track.stop());
-                }
-                if (audioContext) {
-                    audioContext.close();
-                }
+                mediaRecorder = null;
+            }
 
-                isRecording = false;
-                btn.classList.remove('recording');
-                btn.textContent = '🎤';
+            isRecording = false;
+            btn.classList.remove('recording');
+            btn.textContent = '🎤';
+            btn.style.background = '#ff4757';
+
+            // Notify server recording ended
+            if (ws && ws.readyState === WebSocket.OPEN) {
+                ws.send(JSON.stringify({type: 'audio_end'}));
             }
         }
 
