@@ -67,7 +67,7 @@ class OpenRouterLLM(BaseLLM):
     def __init__(
         self,
         api_key: str,
-        model_name: str = "google/gemini-3-flash-preview-0520",
+        model_name: str = "google/gemini-3-flash-preview",
         temperature: float = 0.7,
         max_tokens: int = 1024
     ):
