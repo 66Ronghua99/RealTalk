@@ -294,7 +294,6 @@ class RealTalkWebHandler:
                 if tts_result.audio:
                     chunk_count += 1
                     logger.info(f"TTS audio chunk {chunk_count}: {len(tts_result.audio)} bytes")
-                    import base64
                     audio_b64 = base64.b64encode(tts_result.audio).decode()
                     await self._send_to_client({
                         "type": "tts_audio",
@@ -582,7 +581,7 @@ def get_index_html() -> str:
                     }
                     break;
                 case 'tts_audio':
-                    // Play audio using Web Audio API
+                    // Play audio using Web Audio API (decode MP3)
                     if (data.audio) {
                         console.log('Received tts_audio, length:', data.audio.length);
                         addSystemMessage('Playing TTS audio...');
@@ -594,44 +593,27 @@ def get_index_html() -> str:
                                 bytes[i] = binaryString.charCodeAt(i);
                             }
 
-                            // Log WAV header for debugging - show hex dump
+                            // Debug: show first bytes
                             let hexDump = '';
-                            for (let i = 0; i < Math.min(64, bytes.length); i++) {
+                            for (let i = 0; i < Math.min(16, bytes.length); i++) {
                                 hexDump += bytes[i].toString(16).padStart(2, '0') + ' ';
                             }
-                            console.log('WAV hex dump (first 64 bytes):', hexDump);
+                            console.log('First bytes (hex):', hexDump);
 
-                            const view = new DataView(bytes.buffer);
-                            const riff = String.fromCharCode(bytes[0], bytes[1], bytes[2], bytes[3]);
-                            const wave = String.fromCharCode(bytes[8], bytes[9], bytes[10], bytes[11]);
-                            const fmt = String.fromCharCode(bytes[12], bytes[13], bytes[14], bytes[15]);
-                            const channels = view.getUint16(22, true);
-                            const sampleRate = view.getUint16(24, true);
-                            console.log('WAV header - RIFF:', riff, 'WAVE:', wave, 'fmt:', fmt, 'channels:', channels, 'sampleRate:', sampleRate);
-
-                            // Create audio context
-                            const audioCtx = new (window.AudioContext || window.webkitAudioContext)();
-                            console.log('AudioContext sampleRate:', audioCtx.sampleRate);
-
-                            // Decode the WAV audio
-                            audioCtx.decodeAudioData(bytes.buffer).then(audioBuffer => {
-                                console.log('Audio decoded, duration:', audioBuffer.duration, 'samples:', audioBuffer.length, 'channels:', audioBuffer.numberOfChannels);
-
-                                // Play the audio
-                                const source = audioCtx.createBufferSource();
-                                source.buffer = audioBuffer;
-                                source.connect(audioCtx.destination);
-                                source.start(0);
-                                console.log('Audio playing');
-
-                                source.onended = () => {
-                                    console.log('Audio playback finished');
-                                    addSystemMessage('TTS audio finished!');
-                                };
+                            // Play MP3 directly using Blob URL (simpler than decoding)
+                            const blob = new Blob([bytes], { type: 'audio/mpeg' });
+                            const audioUrl = URL.createObjectURL(blob);
+                            const audio = new Audio(audioUrl);
+                            audio.play().then(() => {
+                                console.log('Audio playing, duration:', audio.duration);
                             }).catch(err => {
-                                console.error('Decode error:', err);
-                                addSystemMessage('Decode error: ' + err.message);
+                                console.error('Audio play error:', err);
                             });
+
+                            audio.onended = () => {
+                                console.log('Audio playback finished');
+                                URL.revokeObjectURL(audioUrl); // Clean up
+                            };
                         } catch (e) {
                             console.error('TTS audio error:', e);
                             addSystemMessage('TTS error: ' + e.message);
