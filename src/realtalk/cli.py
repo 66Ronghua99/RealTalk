@@ -8,16 +8,16 @@ from typing import Optional, List
 import numpy as np
 import sounddevice as sd
 
-from ..cognition.llm import Message
-from ..config import get_config
-from ..logging_config import setup_logger
-from ..orchestration.fsm import State
-from ..orchestration.gatekeeper import Action, GatekeeperInput, create_gatekeeper
-from ..perception.asr import create_asr, BaseASR
-from ..perception.vad import create_vad, BaseVAD
-from ..cognition.llm import create_llm, BaseLLM
-from ..cognition.tts import create_tts, BaseTTS
-from ..orchestration.accumulator import ContextAccumulator
+from realtalk.cognition.llm import Message
+from realtalk.config import get_config
+from realtalk.logging_config import setup_logger
+from realtalk.orchestration.fsm import State
+from realtalk.orchestration.gatekeeper import Action, GatekeeperInput, create_gatekeeper
+from realtalk.perception.asr import create_asr, BaseASR
+from realtalk.perception.vad import create_vad, BaseVAD
+from realtalk.cognition.llm import create_llm, BaseLLM
+from realtalk.cognition.tts import create_tts, BaseTTS
+from realtalk.orchestration.accumulator import ContextAccumulator
 
 logger = setup_logger("realtalk.cli")
 
