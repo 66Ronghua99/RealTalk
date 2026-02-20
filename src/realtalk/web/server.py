@@ -2,17 +2,36 @@
 import asyncio
 import base64
 import json
+import time
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Union
 
 import aiohttp
 from aiohttp import web
 import numpy as np
 
-from ..cognition.llm import OpenRouterLLM, Message
+from ..cognition.llm import OpenRouterLLM, Message as LLMMessage
 from ..cognition.tts import MinimaxTTS
 from ..config import get_config
 from ..logging_config import setup_logger
+from ..messages import (
+    AudioStart,
+    ClearContext,
+    GatekeeperDecision,
+    InterruptRequest,
+    LLMChunk,
+    MicAudioData,
+    MicAudioEnd,
+    ServerMessage,
+    State as StateEnum,
+    StateUpdate,
+    StatusMessage,
+    StubbornnessUpdate,
+    TextInput,
+    Transcript,
+    TTSAudio,
+    deserialize_message,
+)
 from ..orchestration.accumulator import ContextAccumulator, StubbornnessController
 from ..orchestration.fsm import Event, State
 from ..orchestration.gatekeeper import RuleBasedGatekeeper
@@ -86,76 +105,53 @@ class RealTalkWebHandler:
         return ws
 
     async def _handle_message(self, data: dict):
-        """Handle incoming messages."""
-        msg_type = data.get("type")
-        # logger.info(f"Received message type: {msg_type}, data keys: {list(data.keys())}")
+        """Handle incoming messages using Pydantic models."""
+        try:
+            message = deserialize_message(data)
+        except ValueError as e:
+            logger.error(f"Failed to deserialize message: {e}")
+            return
 
-        if msg_type == "text":
-            # User typed text - treat as user speech
-            text = data.get("text", "")
-            await self._process_text(text)
+        # Handle using validated Pydantic models
+        if isinstance(message, TextInput):
+            await self._process_text(message.text)
 
-        elif msg_type == "stubbornness":
-            # Update stubbornness level
-            level = data.get("level", 50)
-            self._stubbornness.level = level
-            await self._send_to_client({
-                "type": "status",
-                "message": f"Stubbornness level: {level}"
-            })
+        elif isinstance(message, StubbornnessUpdate):
+            self._stubbornness.level = message.level
+            await self._send_to_client(
+                StatusMessage(message=f"Stubbornness level: {message.level}")
+            )
 
-        elif msg_type == "interrupt":
-            # Simulate user interruption
-            await self._handle_interrupt(data.get("text", ""))
+        elif isinstance(message, InterruptRequest):
+            await self._handle_interrupt(message.text or "")
 
-        elif msg_type == "clear":
-            # Clear accumulator
+        elif isinstance(message, ClearContext):
             self._accumulator.clear()
-            await self._send_to_client({
-                "type": "status",
-                "message": "Context cleared"
-            })
+            await self._send_to_client(StatusMessage(message="Context cleared"))
 
-        elif msg_type == "mic-audio-data":
-            # Process audio from microphone (float array from frontend VAD)
-            audio_array = data.get("audio", [])
-            # logger.info(f"Received mic-audio-data, length: {len(audio_array)}, first 3 values: {audio_array[:3] if audio_array else []}")
-            await self._process_audio_float(audio_array)
+        elif isinstance(message, MicAudioData):
+            await self._process_audio_float(message.audio)
 
-        elif msg_type == "mic-audio-end":
-            # User stopped speaking - process accumulated audio
+        elif isinstance(message, MicAudioEnd):
             logger.info("Received mic-audio-end")
             await self._process_audio_end()
 
-        elif msg_type == "audio_start":
-            # User started speaking
+        elif isinstance(message, AudioStart):
             logger.info("Received audio_start")
             self._current_state = State.LISTENING
             self._audio_buffer.clear()
-            await self._send_to_client({"type": "state", "state": "listening"})
-
-        elif msg_type == "audio":
-            # Legacy: Process audio from microphone (base64)
-            audio_data = data.get("data", "")
-            is_speaking = data.get("isSpeaking", False)
-            # logger.info(f"Received audio chunk, data length: {len(audio_data)}, isSpeaking: {is_speaking}")
-            await self._process_audio(audio_data)
-
-        elif msg_type == "audio_end":
-            # Legacy: User stopped speaking
-            logger.info("Received audio_end")
-            await self._process_audio_end()
+            await self._send_to_client(
+                StateUpdate(state=StateEnum.LISTENING)
+            )
 
     async def _process_text(self, text: str):
         """Process user text input."""
         self._current_text = text
         self._current_state = State.LISTENING
 
-        await self._send_to_client({
-            "type": "transcript",
-            "text": text,
-            "is_final": True
-        })
+        await self._send_to_client(
+            Transcript(text=text, is_final=True)
+        )
 
         # Gatekeeper decision
         from ..orchestration.gatekeeper import GatekeeperInput
@@ -168,20 +164,20 @@ class RealTalkWebHandler:
 
         decision = await self._gatekeeper.decide(gatekeeper_input)
 
-        await self._send_to_client({
-            "type": "gatekeeper",
-            "action": decision.action.value,
-            "confidence": decision.confidence
-        })
+        await self._send_to_client(
+            GatekeeperDecision(
+                action=decision.action.value,
+                confidence=decision.confidence
+            )
+        )
 
         if decision.action.value == "reply":
             await self._generate_response(text)
         elif decision.action.value == "accumulate":
             self._accumulator.add_segment(text)
-            await self._send_to_client({
-                "type": "status",
-                "message": "Accumulated for context"
-            })
+            await self._send_to_client(
+                StatusMessage(message="Accumulated for context")
+            )
 
     async def _process_audio(self, audio_base64: str):
         """Process incoming audio chunk from browser (legacy base64 format)."""
@@ -225,10 +221,9 @@ class RealTalkWebHandler:
         """Process accumulated audio when user stops speaking."""
         if not self._audio_buffer:
             logger.warning("No audio buffer to process")
-            await self._send_to_client({
-                "type": "status",
-                "message": "No audio recorded"
-            })
+            await self._send_to_client(
+                StatusMessage(message="No audio recorded")
+            )
             return
 
         # Combine all audio chunks
@@ -243,16 +238,14 @@ class RealTalkWebHandler:
             if asr_result.text:
                 await self._process_text(asr_result.text)
             else:
-                await self._send_to_client({
-                    "type": "status",
-                    "message": "No speech detected"
-                })
+                await self._send_to_client(
+                    StatusMessage(message="No speech detected")
+                )
         except Exception as e:
             logger.error(f"ASR error: {e}")
-            await self._send_to_client({
-                "type": "status",
-                "message": f"ASR error: {e}"
-            })
+            await self._send_to_client(
+                StatusMessage(message=f"ASR error: {e}")
+            )
         finally:
             self._audio_buffer.clear()
 
@@ -270,23 +263,24 @@ class RealTalkWebHandler:
 
         # Build messages
         messages = [
-            Message(role="system", content="You are a helpful and conversational AI assistant."),
-            Message(role="user", content=context)
+            LLMMessage(role="system", content="You are a helpful and conversational AI assistant."),
+            LLMMessage(role="user", content=context)
         ]
 
         # Stream LLM response
         response_text = ""
         async for chunk in self._llm.stream_chat(messages):
             response_text = chunk.content
-            await self._send_to_client({
-                "type": "llm_chunk",
-                "text": response_text
-            })
+            await self._send_to_client(
+                LLMChunk(text=response_text)
+            )
 
         # Synthesize TTS
         self._current_state = State.SPEAKING
         self._is_speaking = True
-        await self._send_to_client({"type": "state", "state": "speaking"})
+        await self._send_to_client(
+            StateUpdate(state=StateEnum.SPEAKING)
+        )
 
         logger.info(f"Starting TTS for text: {response_text[:50]}...")
         try:
@@ -297,22 +291,25 @@ class RealTalkWebHandler:
                     chunk_count += 1
                     logger.info(f"TTS audio chunk {chunk_count}: {len(tts_result.audio)} bytes")
                     audio_b64 = base64.b64encode(tts_result.audio).decode()
-                    await self._send_to_client({
-                        "type": "tts_audio",
-                        "audio": audio_b64,
-                        "is_final": tts_result.is_final
-                    })
+                    await self._send_to_client(
+                        TTSAudio(
+                            audio=audio_b64,
+                            is_final=tts_result.is_final,
+                            chunk_index=chunk_count - 1
+                        )
+                    )
             logger.info(f"TTS complete, total chunks: {chunk_count}")
         except Exception as e:
             logger.error(f"TTS error: {e}", exc_info=True)
-            await self._send_to_client({
-                "type": "status",
-                "message": f"TTS error: {e}"
-            })
+            await self._send_to_client(
+                StatusMessage(message=f"TTS error: {e}")
+            )
 
         self._current_state = State.LISTENING
         self._is_speaking = False
-        await self._send_to_client({"type": "state", "state": "listening"})
+        await self._send_to_client(
+            StateUpdate(state=StateEnum.LISTENING)
+        )
 
     async def _handle_interrupt(self, text: str):
         """Handle user interruption."""
@@ -324,23 +321,33 @@ class RealTalkWebHandler:
 
         if should_ignore:
             self._accumulator.add_segment(text, is_interrupt=True)
-            await self._send_to_client({
-                "type": "status",
-                "message": "Ignored (stubborn mode)"
-            })
+            await self._send_to_client(
+                StatusMessage(message="Ignored (stubborn mode)")
+            )
         else:
             await self._tts.stop()
             self._is_speaking = False
             self._current_state = State.INTERRUPTED
-            await self._send_to_client({
-                "type": "state",
-                "state": "interrupted"
-            })
+            await self._send_to_client(
+                StateUpdate(state=StateEnum.INTERRUPTED)
+            )
 
-    async def _send_to_client(self, data: dict):
-        """Send message to WebSocket client."""
-        if self._ws and not self._ws.closed:
-            await self._ws.send_json(data)
+    async def _send_to_client(self, message: Union[ServerMessage, dict]):
+        """Send message to WebSocket client.
+
+        Args:
+            message: Either a Pydantic ServerMessage model or legacy dict
+        """
+        if not self._ws or self._ws.closed:
+            return
+
+        if isinstance(message, ServerMessage):
+            # Add timestamp before sending
+            message.timestamp = int(time.time() * 1000)
+            await self._ws.send_json(message.to_dict())
+        else:
+            # Legacy dict support (for backwards compatibility)
+            await self._ws.send_json(message)
 
 
 async def create_app() -> web.Application:
