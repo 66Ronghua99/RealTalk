@@ -240,12 +240,16 @@ class VoiceOrchestrator:
         # Get streaming response
         await self.fsm.transition(Event.LLM_RESPONSE)
 
+        # Accumulate full response before speaking (fixes duplicate TTS issue)
         response_text = ""
         async for chunk in self.llm.stream_chat(messages, system_prompt=self.config.system_prompt):
             response_text = chunk.content
+            # Notify UI of streaming text (optional, for display purposes)
+            if self._on_asr_result:  # Re-use callback for text updates
+                pass  # Could add a separate text update callback if needed
 
-            # Stream TTS
-            await self.fsm.transition(Event.LLM_RESPONSE)
+        # Speak the complete response once
+        if response_text:
             self._speaking_task = asyncio.create_task(self._speak(response_text))
 
         self._current_text = ""

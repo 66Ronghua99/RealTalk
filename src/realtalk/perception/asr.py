@@ -140,6 +140,9 @@ class MinimaxASR(BaseASR):
     async def stream_audio(self, audio_stream: AsyncIterator[bytes]) -> AsyncIterator[ASRResult]:
         """Process streaming audio and yield results."""
         buffer = b""
+        # Keep last 100ms as overlap to preserve partial words (P0 fix)
+        overlap_duration_ms = 100
+        overlap_bytes = int(self.sample_rate * 2 * overlap_duration_ms / 1000)
 
         async for chunk in audio_stream:
             buffer += chunk
@@ -151,7 +154,8 @@ class MinimaxASR(BaseASR):
                     result = await self.recognize(buffer)
                     if result.text:
                         yield result
-                    buffer = b""
+                    # Keep overlap for next chunk instead of complete reset
+                    buffer = buffer[-overlap_bytes:] if len(buffer) > overlap_bytes else b""
                 except Exception as e:
                     logger.error(f"Error processing audio chunk: {e}")
 
@@ -247,6 +251,10 @@ class SherpaOnnxASR(BaseASR):
     async def stream_audio(self, audio_stream: AsyncIterator[bytes]) -> AsyncIterator[ASRResult]:
         """Process streaming audio."""
         buffer = b""
+        # Keep last 100ms as overlap to preserve partial words (P0 fix)
+        overlap_duration_ms = 100
+        overlap_bytes = int(self.sample_rate * 2 * overlap_duration_ms / 1000)
+
         async for chunk in audio_stream:
             buffer += chunk
             # Process every 1 second of audio
@@ -254,7 +262,8 @@ class SherpaOnnxASR(BaseASR):
                 result = await self.recognize(buffer)
                 if result.text:
                     yield result
-                buffer = b""
+                # Keep overlap for next chunk instead of complete reset
+                buffer = buffer[-overlap_bytes:] if len(buffer) > overlap_bytes else b""
 
     async def close(self) -> None:
         """Close the ASR."""

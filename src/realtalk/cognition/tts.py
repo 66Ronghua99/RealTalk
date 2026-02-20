@@ -218,57 +218,61 @@ class MinimaxTTS(BaseTTS):
                     pass
 
                 # Parse as SSE
-                for line_str in content_bytes.decode().split('\n'):
+                lines = content_bytes.decode().split('\n')
+                # Find all audio data lines
+                audio_lines = []
+                for line_str in lines:
+                    line_str = line_str.strip()
+                    if line_str.startswith("data: ") and line_str[6:] != "[DONE]":
+                        audio_lines.append(line_str[6:])
+
+                # Yield all audio chunks except last one as not final, last one as final
+                for i, data_str in enumerate(audio_lines):
                     if self._stop_event.is_set():
                         break
 
-                    line_str = line_str.strip()
-                    if not line_str:
+                    try:
+                        data = json.loads(data_str)
+                        logger.info(f"TTS data keys: {data.keys()}")
+
+                        # Check for API error
+                        if "base_resp" in data and data["base_resp"].get("status_code") != 0:
+                            error_msg = data["base_resp"].get("status_msg", "Unknown error")
+                            logger.error(f"TTS API error: {error_msg}")
+                            raise TTSError(f"TTS API error: {error_msg}")
+
+                        if "data" in data and "audio" in data["data"]:
+                            audio_data = data["data"]["audio"]
+                            # Note: API returns hex-encoded string
+                            if isinstance(audio_data, str):
+                                audio_data = bytes.fromhex(audio_data)  # Decode hex string
+                            logger.info(f"TTS audio field type: {type(audio_data)}, length: {len(audio_data) if audio_data else 0}")
+
+                            # Set is_final=True only for the last chunk
+                            is_final = (i == len(audio_lines) - 1)
+
+                            yield TTSResult(
+                                audio=audio_data,
+                                sample_rate=self.sample_rate,
+                                is_final=is_final,
+                                text=text
+                            )
+                        else:
+                            logger.warning(f"TTS data format unexpected: {data}")
+                    except json.JSONDecodeError as e:
+                        logger.warning(f"TTS JSON decode error: {e}")
                         continue
 
-                    logger.debug(f"TTS line: {line_str[:100]}...")
-
-                    if line_str.startswith("data: "):
-                        data_str = line_str[6:]
-                        if data_str == "[DONE]":
-                            logger.info("TTS stream done")
-                            break
-
-                        try:
-                            data = json.loads(data_str)
-                            logger.info(f"TTS data keys: {data.keys()}")
-
-                            # Check for API error
-                            if "base_resp" in data and data["base_resp"].get("status_code") != 0:
-                                error_msg = data["base_resp"].get("status_msg", "Unknown error")
-                                logger.error(f"TTS API error: {error_msg}")
-                                raise TTSError(f"TTS API error: {error_msg}")
-
-                            if "data" in data and "audio" in data["data"]:
-                                audio_data = data["data"]["audio"]
-                                # Note: API returns hex-encoded string
-                                if isinstance(audio_data, str):
-                                    audio_data = bytes.fromhex(audio_data)  # Decode hex string
-                                logger.info(f"TTS audio field type: {type(audio_data)}, length: {len(audio_data) if audio_data else 0}")
-                                is_final = data.get("is_final", False)
-
-                                yield TTSResult(
-                                    audio=audio_data,
-                                    sample_rate=self.sample_rate,
-                                    is_final=is_final,
-                                    text=text
-                                )
-                            else:
-                                logger.warning(f"TTS data format unexpected: {data}")
-                        except json.JSONDecodeError as e:
-                            logger.warning(f"TTS JSON decode error: {e}")
-                            continue
+                logger.info("TTS stream done")
 
         except asyncio.CancelledError:
             logger.info("TTS stream cancelled")
         except Exception as e:
             logger.error(f"TTS stream error: {e}")
             raise TTSError(f"TTS stream failed: {e}")
+        finally:
+            # Clear stop event only when stream is fully complete
+            self._stop_event.clear()
 
     async def stop(self) -> None:
         """Stop ongoing synthesis."""
@@ -279,7 +283,8 @@ class MinimaxTTS(BaseTTS):
                 await self._current_task
             except asyncio.CancelledError:
                 pass
-        self._stop_event.clear()
+        # Don't clear _stop_event here - let stream_synthesize handle it
+        # This prevents race conditions where new chunks are yielded after stop
 
     async def close(self) -> None:
         """Close the TTS."""

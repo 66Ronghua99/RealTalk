@@ -210,7 +210,9 @@ class RealTalkWebHandler:
         try:
             # Convert float array to numpy and then to bytes
             audio_array = np.array(audio_list, dtype=np.float32)
-            audio_bytes = (audio_array * 32767).astype(np.int16).tobytes()
+            # Clip values to prevent overflow/distortion (P0 fix)
+            audio_clipped = np.clip(audio_array, -1.0, 1.0)
+            audio_bytes = (audio_clipped * 32767).astype(np.int16).tobytes()
 
             # logger.info(f"Processed float audio: {len(audio_bytes)} bytes, buffer size now: {len(self._audio_buffer) + 1}")
             self._audio_buffer.append(audio_bytes)
@@ -297,7 +299,8 @@ class RealTalkWebHandler:
                     audio_b64 = base64.b64encode(tts_result.audio).decode()
                     await self._send_to_client({
                         "type": "tts_audio",
-                        "audio": audio_b64
+                        "audio": audio_b64,
+                        "is_final": tts_result.is_final
                     })
             logger.info(f"TTS complete, total chunks: {chunk_count}")
         except Exception as e:
@@ -546,6 +549,10 @@ def get_index_html() -> str:
         let ws = null;
         let accumulatedCount = 0;
 
+        // Audio chunk accumulation
+        let audioChunks = [];
+        let isPlayingAudio = false;  // P0 fix: track playback state to prevent duplicates
+
         function connect() {
             const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
             ws = new WebSocket(`${protocol}//${window.location.host}/ws`);
@@ -581,42 +588,88 @@ def get_index_html() -> str:
                     }
                     break;
                 case 'tts_audio':
-                    // Play audio using Web Audio API (decode MP3)
+                    // Accumulate audio chunks and play when complete
                     if (data.audio) {
-                        console.log('Received tts_audio, length:', data.audio.length);
-                        addSystemMessage('Playing TTS audio...');
-                        try {
-                            // Decode base64 to binary
-                            const binaryString = atob(data.audio);
-                            const bytes = new Uint8Array(binaryString.length);
-                            for (let i = 0; i < binaryString.length; i++) {
-                                bytes[i] = binaryString.charCodeAt(i);
+                        console.log('Received tts_audio, length:', data.audio.length, 'is_final:', data.is_final);
+
+                        // P0 fix: Reset audio chunks if we're starting a new TTS stream
+                        // This prevents race condition where old chunks persist
+                        if (isPlayingAudio) {
+                            console.log('New TTS while audio playing - resetting chunks');
+                            audioChunks = [];
+                            isPlayingAudio = false;
+                        }
+
+                        // Decode base64 to binary
+                        const binaryString = atob(data.audio);
+                        const bytes = new Uint8Array(binaryString.length);
+                        for (let i = 0; i < binaryString.length; i++) {
+                            bytes[i] = binaryString.charCodeAt(i);
+                        }
+                        audioChunks.push(bytes);
+
+                        // Only play when all chunks are received
+                        if (data.is_final) {
+                            console.log('All chunks received, total:', audioChunks.length);
+                            addSystemMessage('Playing TTS audio...');
+
+                            try {
+                                // Combine all chunks
+                                const totalLength = audioChunks.reduce((sum, chunk) => sum + chunk.length, 0);
+                                const combined = new Uint8Array(totalLength);
+                                let offset = 0;
+                                for (const chunk of audioChunks) {
+                                    combined.set(chunk, offset);
+                                    offset += chunk.length;
+                                }
+
+                                // Debug: show first bytes
+                                let hexDump = '';
+                                for (let i = 0; i < Math.min(16, combined.length); i++) {
+                                    hexDump += combined[i].toString(16).padStart(2, '0') + ' ';
+                                }
+                                console.log('First bytes (hex):', hexDump);
+
+                                // Play combined MP3
+                                const blob = new Blob([combined], { type: 'audio/mpeg' });
+                                const audioUrl = URL.createObjectURL(blob);
+                                console.log('Creating Audio element, url:', audioUrl);
+                                const audio = new Audio(audioUrl);
+
+                                // P0 fix: Set playback flag before playing
+                                isPlayingAudio = true;
+
+                                // Prevent duplicate play
+                                let played = false;
+                                const doPlay = () => {
+                                    if (played) {
+                                        console.log('Audio already played, skipping');
+                                        return;
+                                    }
+                                    played = true;
+                                    console.log('Calling audio.play()');
+                                    return audio.play();
+                                };
+
+                                doPlay().then(() => {
+                                    console.log('Audio playing, duration:', audio.duration);
+                                }).catch(err => {
+                                    console.error('Audio play error:', err);
+                                    isPlayingAudio = false;  // Reset flag on error
+                                });
+
+                                audio.onended = () => {
+                                    console.log('Audio playback finished');
+                                    URL.revokeObjectURL(audioUrl);
+                                    audioChunks = []; // Clear for next time
+                                    isPlayingAudio = false;  // P0 fix: Reset playback flag
+                                };
+                            } catch (e) {
+                                console.error('TTS audio error:', e);
+                                addSystemMessage('TTS error: ' + e.message);
+                                audioChunks = [];
+                                isPlayingAudio = false;  // P0 fix: Reset playback flag on error
                             }
-
-                            // Debug: show first bytes
-                            let hexDump = '';
-                            for (let i = 0; i < Math.min(16, bytes.length); i++) {
-                                hexDump += bytes[i].toString(16).padStart(2, '0') + ' ';
-                            }
-                            console.log('First bytes (hex):', hexDump);
-
-                            // Play MP3 directly using Blob URL (simpler than decoding)
-                            const blob = new Blob([bytes], { type: 'audio/mpeg' });
-                            const audioUrl = URL.createObjectURL(blob);
-                            const audio = new Audio(audioUrl);
-                            audio.play().then(() => {
-                                console.log('Audio playing, duration:', audio.duration);
-                            }).catch(err => {
-                                console.error('Audio play error:', err);
-                            });
-
-                            audio.onended = () => {
-                                console.log('Audio playback finished');
-                                URL.revokeObjectURL(audioUrl); // Clean up
-                            };
-                        } catch (e) {
-                            console.error('TTS audio error:', e);
-                            addSystemMessage('TTS error: ' + e.message);
                         }
                     }
                     break;
