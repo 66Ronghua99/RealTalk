@@ -6,37 +6,43 @@ RealTalk is a human-like full-duplex voice interaction core module enabling natu
 ## Current Status
 **Date:** 2026-02-20
 
-### ✅ Sprint Complete: P0 Critical Bug Fixes
+### ✅ Completed: P0 Critical Bug Fixes
+All P0 fixes pushed to master.
 
-## Issues Fixed
+### ✅ Completed: Phase 1 - Frontend/Backend Separation
 
-### P0: TTS Audio Double Playback
-- [x] Fix race condition in frontend (reset audioChunks on new TTS)
-- [x] Debounce TTS task creation in orchestrator
-- [x] Fix TTS stop event timing
+## Phase 1 Completed
 
-### P0: ASR Accuracy Problems
-- [x] Add clipping protection in server.py
-- [x] Implement sliding window buffer in ASR
+### Extracted Files
+- `src/realtalk/web/templates/index.html` - HTML template
+- `src/realtalk/web/static/css/style.css` - CSS styles (114 lines)
+- `src/realtalk/web/static/js/app.js` - JavaScript (376 lines)
 
-## Verification
-- All 23 existing tests pass
-- No regressions introduced
-- See `memory/MEMORY.md` for detailed fix documentation
+### Server.py Changes
+- Updated `create_app()` to serve static files and templates
+- `get_index_html()` now reads from template file with minimal fallback
+- Server reduced from 971 lines to ~420 lines (57% reduction in embedded frontend code)
 
-## Implementation Plan
+### Benefits
+- Frontend code can now be edited with proper IDE support
+- CSS and JS are cached by browsers (better performance)
+- Clearer separation of concerns
+- Easier to maintain and test
 
-### Phase 1: TTS Double Playback Fixes
-1. Fix orchestrator to accumulate LLM response before speaking once
-2. Fix TTS stop() to not clear _stop_event immediately
-3. Add frontend protection against duplicate playback
+## Next Phase Options
 
-### Phase 2: ASR Accuracy Fixes
-1. Add np.clip() protection for float-to-int16 conversion
-2. Implement sliding window buffer to preserve partial words
+### Phase 2: API Formalization (Medium Risk)
+- Define JSON Schema for all WebSocket messages
+- Create message bus pattern
+- Add API versioning
 
-## Files to Modify
-- `src/realtalk/core/orchestrator.py` - TTS task debouncing
-- `src/realtalk/cognition/tts.py` - Stop event handling
-- `src/realtalk/web/server.py` - Frontend race condition, ASR clipping
-- `src/realtalk/perception/asr.py` - Sliding window buffer
+### Phase 3: Architecture Refactoring (High Risk)
+- Implement proper event-driven state machine
+- Remove DOM manipulation references from backend
+- Create client-side state store
+
+## Stats
+- Lines extracted from server.py: ~545 lines
+- Current server.py: ~420 lines (was 971)
+- New files created: 3
+- All 23 tests pass

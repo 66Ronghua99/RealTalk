@@ -1,0 +1,52 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>RealTalk - Voice Interaction</title>
+    <link rel="stylesheet" href="/static/css/style.css">
+</head>
+<body>
+    <div class="container">
+        <h1>RealTalk - Voice Interaction</h1>
+
+        <button class="mic-button" id="micBtn" onclick="toggleMic()">🎤</button>
+
+        <div class="status-bar">
+            <div class="status-item">
+                <div class="status-label">State</div>
+                <div class="status-value" id="state">IDLE</div>
+            </div>
+            <div class="status-item">
+                <div class="status-label">Gatekeeper</div>
+                <div class="status-value" id="gatekeeper">-</div>
+            </div>
+            <div class="status-item">
+                <div class="status-label">Accumulated</div>
+                <div class="status-value" id="accumulated">0</div>
+            </div>
+        </div>
+
+        <div class="controls">
+            <div class="control-group">
+                <label>Stubbornness Level: <span class="stubbornness-value" id="stubbornness-val">50</span></label>
+                <input type="range" id="stubbornness" min="0" max="100" value="50">
+            </div>
+            <div class="control-group">
+                <button class="btn-interrupt" onclick="interrupt()">Interrupt</button>
+                <button onclick="clearContext()">Clear Context</button>
+                <button class="btn-test" onclick="testAudio()">Test Audio</button>
+            </div>
+        </div>
+
+        <div class="chat-container" id="chat"></div>
+
+        <div class="input-area">
+            <input type="text" id="message" placeholder="Type your message..." onkeypress="handleKeyPress(event)">
+            <button class="btn-send" onclick="sendMessage()">Send</button>
+        </div>
+    </div>
+
+    <script src="/static/js/app.js"></script>
+</body>
+</html>

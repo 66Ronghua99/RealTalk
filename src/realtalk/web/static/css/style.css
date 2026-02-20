@@ -1,0 +1,113 @@
+* { box-sizing: border-box; margin: 0; padding: 0; }
+body {
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+    background: linear-gradient(135deg, #1a1a2e 0%, #16213e 100%);
+    color: #fff;
+    min-height: 100vh;
+    padding: 20px;
+}
+.container { max-width: 800px; margin: 0 auto; }
+h1 { text-align: center; margin-bottom: 30px; color: #00d9ff; }
+.status-bar {
+    display: flex;
+    justify-content: space-around;
+    margin-bottom: 20px;
+    padding: 15px;
+    background: rgba(255,255,255,0.1);
+    border-radius: 10px;
+}
+.status-item { text-align: center; }
+.status-label { font-size: 12px; color: #888; }
+.status-value { font-size: 18px; font-weight: bold; color: #00d9ff; }
+.chat-container {
+    background: rgba(255,255,255,0.05);
+    border-radius: 10px;
+    padding: 20px;
+    min-height: 300px;
+    margin-bottom: 20px;
+    max-height: 400px;
+    overflow-y: auto;
+}
+.message {
+    margin-bottom: 15px;
+    padding: 10px 15px;
+    border-radius: 10px;
+    max-width: 80%;
+}
+.message.user {
+    background: #007bff;
+    margin-left: auto;
+}
+.message.assistant {
+    background: #28a745;
+}
+.message.system {
+    background: rgba(255,255,255,0.1);
+    color: #888;
+    font-size: 12px;
+    text-align: center;
+    max-width: 100%;
+}
+.input-area {
+    display: flex;
+    gap: 10px;
+    margin-bottom: 20px;
+}
+input[type="text"] {
+    flex: 1;
+    padding: 15px;
+    border: none;
+    border-radius: 10px;
+    font-size: 16px;
+    background: rgba(255,255,255,0.1);
+    color: #fff;
+}
+input[type="text"]:focus { outline: 2px solid #00d9ff; }
+button {
+    padding: 15px 30px;
+    border: none;
+    border-radius: 10px;
+    font-size: 16px;
+    cursor: pointer;
+    transition: all 0.3s;
+}
+.btn-send { background: #00d9ff; color: #000; }
+.btn-send:hover { background: #00b8d4; }
+.btn-interrupt { background: #ff4757; color: #fff; }
+.btn-interrupt:hover { background: #ff3344; }
+.btn-test { background: #ffa500; color: #000; }
+.btn-test:hover { background: #ff8c00; }
+.controls {
+    display: flex;
+    gap: 10px;
+    margin-bottom: 20px;
+}
+.control-group {
+    flex: 1;
+    padding: 15px;
+    background: rgba(255,255,255,0.1);
+    border-radius: 10px;
+}
+.control-group label { display: block; margin-bottom: 10px; }
+input[type="range"] { width: 100%; }
+.stubbornness-value { color: #00d9ff; font-weight: bold; }
+.mic-button {
+    width: 60px;
+    height: 60px;
+    border-radius: 50%;
+    background: #ff4757;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    margin: 0 auto 20px;
+    font-size: 24px;
+}
+.mic-button.recording {
+    background: #ff0000;
+    animation: pulse 1s infinite;
+}
+@keyframes pulse {
+    0% { transform: scale(1); }
+    50% { transform: scale(1.1); }
+    100% { transform: scale(1); }
+}
