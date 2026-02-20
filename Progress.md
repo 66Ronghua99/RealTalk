@@ -11,6 +11,8 @@ All P0 fixes pushed to master.
 
 ### ✅ Completed: Phase 1 - Frontend/Backend Separation
 
+### ✅ Completed: Phase 2 - API Formalization
+
 ## Phase 1 Completed
 
 ### Extracted Files
@@ -29,20 +31,57 @@ All P0 fixes pushed to master.
 - Clearer separation of concerns
 - Easier to maintain and test
 
-## Next Phase Options
+## Phase 2 Completed
 
-### Phase 2: API Formalization (Medium Risk)
-- Define JSON Schema for all WebSocket messages
-- Create message bus pattern
-- Add API versioning
+### New Files
+- `src/realtalk/messages.py` - Pydantic message models (API v1.0.0)
+  - 14 message types (7 client→server, 7 server→client)
+  - Type-safe validation with bounds checking
+  - JSON Schema generation support
+  - `deserialize_message()` for automatic type resolution
+
+- `src/realtalk/web/message_bus.py` - Publish-subscribe message bus
+  - `MessageBus` class for decoupled message routing
+  - Middleware support for logging/transformations
+  - Metrics collection
+  - `TypedMessageBus` variant for better IDE support
+
+- `tests/test_messages.py` - Comprehensive message tests (42 tests)
+- `docs/MESSAGES.md` - Complete protocol documentation
+
+### Server.py Updates
+- Migrated from dict-based to Pydantic model-based messages
+- All outgoing messages now include timestamps
+- Type-safe message handling with proper validation
+- Removed legacy message support (`audio`, `audio_end`)
+
+### API Version
+- Current: **v1.0.0**
+- All messages include `api_version` field
+- Deserialization validates message structure
+
+### Benefits
+- **Type Safety**: Compile-time checking with Pydantic validation
+- **Documentation**: JSON Schema for all message types
+- **Testability**: Easy to mock and test message flows
+- **Extensibility**: New message types follow established patterns
+- **Debugging**: Validation errors provide clear feedback
+
+## Next Phase Options
 
 ### Phase 3: Architecture Refactoring (High Risk)
 - Implement proper event-driven state machine
 - Remove DOM manipulation references from backend
 - Create client-side state store
+- Consider using MessageBus in server handlers
 
 ## Stats
-- Lines extracted from server.py: ~545 lines
-- Current server.py: ~420 lines (was 971)
-- New files created: 3
-- All 23 tests pass
+| Metric | Value |
+|--------|-------|
+| Lines extracted from server.py (Phase 1) | ~545 |
+| Current server.py | ~420 lines (was 971) |
+| New files (Phase 1) | 3 |
+| New files (Phase 2) | 4 |
+| Total tests | 65 (23 + 42 new) |
+| Message types | 14 |
+| API version | 1.0.0 |
