@@ -270,7 +270,7 @@ class RealTalkWebHandler:
         # Stream LLM response
         response_text = ""
         async for chunk in self._llm.stream_chat(messages):
-            response_text = chunk.content
+            response_text += chunk.content  # Append, don't overwrite!
             await self._send_to_client(
                 LLMChunk(text=response_text)
             )
@@ -283,22 +283,38 @@ class RealTalkWebHandler:
         )
 
         logger.info(f"Starting TTS for text: {response_text[:50]}...")
+
+        # Debug: Save LLM response text
+        import time
+        debug_text_path = f"/Users/cory/codes/RealTalk/debug_server_llm_{int(time.time()*1000)}.txt"
+        with open(debug_text_path, "w") as f:
+            f.write(response_text)
+        logger.info(f"Server LLM response saved to {debug_text_path}")
+
         try:
-            chunk_count = 0
-            async for tts_result in self._tts.stream_synthesize(response_text):
-                logger.info(f"TTS result: audio={tts_result.audio is not None}, is_final={tts_result.is_final}")
-                if tts_result.audio:
-                    chunk_count += 1
-                    logger.info(f"TTS audio chunk {chunk_count}: {len(tts_result.audio)} bytes")
-                    audio_b64 = base64.b64encode(tts_result.audio).decode()
-                    await self._send_to_client(
-                        TTSAudio(
-                            audio=audio_b64,
-                            is_final=tts_result.is_final,
-                            chunk_index=chunk_count - 1
-                        )
+            # FIX: Use synthesize() instead of stream_synthesize() to avoid duplicate playback issue
+            # stream_synthesize() returns cumulative chunks which causes each chunk to contain
+            # all previous audio, leading to repeated playback on the client side
+            tts_result = await self._tts.synthesize(response_text)
+
+            if tts_result.audio:
+                logger.info(f"TTS audio: {len(tts_result.audio)} bytes")
+
+                # Debug: Save audio to file
+                debug_audio_path = f"/Users/cory/codes/RealTalk/debug_server_tts_{int(time.time()*1000)}.mp3"
+                with open(debug_audio_path, "wb") as f:
+                    f.write(tts_result.audio)
+                logger.info(f"Server TTS audio saved to {debug_audio_path}")
+
+                audio_b64 = base64.b64encode(tts_result.audio).decode()
+                await self._send_to_client(
+                    TTSAudio(
+                        audio=audio_b64,
+                        is_final=True,
+                        chunk_index=0
                     )
-            logger.info(f"TTS complete, total chunks: {chunk_count}")
+                )
+            logger.info("TTS complete")
         except Exception as e:
             logger.error(f"TTS error: {e}", exc_info=True)
             await self._send_to_client(

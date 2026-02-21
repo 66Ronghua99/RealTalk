@@ -1,7 +1,9 @@
 """Main Orchestrator - Ties all components together."""
 import asyncio
+from collections import deque
 from dataclasses import dataclass, field
 from typing import Any, AsyncIterator, Dict, List, Optional
+import time
 
 from ..cognition.llm import BaseLLM, Message
 from ..cognition.tts import BaseTTS
@@ -13,6 +15,7 @@ from ..perception.vad import BaseVAD
 from ..orchestration.accumulator import ContextAccumulator, StubbornnessController
 from ..orchestration.fsm import Event, FiniteStateMachine, State, create_default_fsm
 from ..orchestration.gatekeeper import Action, GatekeeperInput, create_gatekeeper
+from .response_generator import ResponseGenerator, GenerationConfig
 
 logger = setup_logger("realtalk.orchestrator")
 
@@ -60,6 +63,22 @@ class VoiceOrchestrator:
         self.accumulator = ContextAccumulator() if self.config.enable_accumulation else None
         self.stubbornness = StubbornnessController(
             level=cfg.orchestration.stubbornness_level
+        )
+
+        # Response generator with conversation history
+        gen_config = GenerationConfig(
+            system_prompt=self.config.system_prompt,
+            enable_streaming_tts=True
+        )
+        self.response_generator = ResponseGenerator(
+            llm=llm,
+            tts=tts,
+            config=gen_config
+        )
+        # Set up callbacks for TTS and completion
+        self.response_generator.set_callbacks(
+            on_audio_chunk=lambda audio: self._on_tts_audio(audio) if self._on_tts_audio else None,
+            on_complete=lambda text: asyncio.create_task(self._on_response_complete())
         )
 
         # State tracking
@@ -133,6 +152,10 @@ class VoiceOrchestrator:
         This is the main entry point for audio data from the transport layer.
         """
         if not self._running:
+            return
+
+        # Prevent processing during response generation (echo suppression + duplicate prevention)
+        if self.response_generator.is_generating():
             return
 
         # VAD detection
@@ -225,7 +248,14 @@ class VoiceOrchestrator:
         self._last_speech_time = None
 
     async def _generate_response(self) -> None:
-        """Generate LLM response and speak it."""
+        """Generate LLM response and speak it using ResponseGenerator."""
+        # Prevent concurrent response generation
+        if self.response_generator.is_generating():
+            logger.warning("Already generating response, skipping duplicate request")
+            return
+
+        await self.fsm.transition(Event.LLM_RESPONSE)
+
         # Get text to respond to
         if self.accumulator and len(self.accumulator) > 0:
             # Use accumulated context
@@ -234,36 +264,21 @@ class VoiceOrchestrator:
         else:
             context = self._current_text
 
-        # Build messages
-        messages = [Message(role="user", content=context)]
+        try:
+            # Use ResponseGenerator for unified handling
+            response_text = await self.response_generator.generate_response(context)
 
-        # Get streaming response
-        await self.fsm.transition(Event.LLM_RESPONSE)
+            if response_text:
+                logger.info(f"Generated response: '{response_text[:50]}...'")
+            else:
+                logger.warning("Response generation returned None")
 
-        # Accumulate full response before speaking (fixes duplicate TTS issue)
-        response_text = ""
-        async for chunk in self.llm.stream_chat(messages, system_prompt=self.config.system_prompt):
-            response_text = chunk.content
-            # Notify UI of streaming text (optional, for display purposes)
-            if self._on_asr_result:  # Re-use callback for text updates
-                pass  # Could add a separate text update callback if needed
-
-        # Speak the complete response once
-        if response_text:
-            self._speaking_task = asyncio.create_task(self._speak(response_text))
+        except Exception as e:
+            logger.error(f"Error generating response: {e}")
+            import traceback
+            traceback.print_exc()
 
         self._current_text = ""
-
-    async def _speak(self, text: str) -> None:
-        """Speak the given text."""
-        await self.fsm.transition(Event.LLM_RESPONSE)
-
-        # Stream TTS
-        async for tts_result in self.tts.stream_synthesize(text):
-            if self._on_tts_audio and tts_result.audio:
-                self._on_tts_audio(tts_result.audio)
-
-        await self.fsm.transition(Event.TTS_COMPLETE)
 
     # State handlers
     async def _on_listening(self) -> None:
@@ -294,6 +309,10 @@ class VoiceOrchestrator:
         """Handle accumulator flush - generate response to accumulated context."""
         logger.info(f"Accumulator flushed with: {text[:50]}...")
         await self._generate_response()
+
+    async def _on_response_complete(self) -> None:
+        """Handle response generation and TTS completion."""
+        await self.fsm.transition(Event.TTS_COMPLETE)
 
     # Callbacks
     def set_asr_callback(self, callback: callable) -> None:
