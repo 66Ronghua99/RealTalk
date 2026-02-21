@@ -18,7 +18,7 @@ class ApiConfig(BaseModel):
 class VADConfig(BaseModel):
     """VAD configuration."""
     model_name: str = "silero"
-    threshold: float = 0.5
+    threshold: float = 0.4
     min_speech_duration_ms: int = 250
     minSilence_duration_ms: int = 300
 

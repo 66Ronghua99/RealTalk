@@ -46,17 +46,20 @@ class SileroVAD(BaseVAD):
     async def load(self) -> None:
         """Load the Silero VAD model."""
         try:
-            import torch
-            from silero import vad
+            from silero_vad import load_silero_vad
 
-            self._model, _ = vad.load(model_id="silero_v5", language="en")
+            self._model = load_silero_vad()
             logger.info("Silero VAD model loaded successfully")
         except ImportError:
             logger.warning("silero-vad not installed, using fallback")
             self._model = None
 
     async def detect(self, audio_chunk: np.ndarray) -> VADResult:
-        """Detect voice activity."""
+        """Detect voice activity.
+
+        New silero-vad v6.x requires 512 samples (32ms @ 16kHz) per inference.
+        We split the audio chunk into frames and aggregate results.
+        """
         if self._model is None:
             # Fallback: simple energy-based detection
             return self._energy_based_detection(audio_chunk)
@@ -64,29 +67,53 @@ class SileroVAD(BaseVAD):
         try:
             import torch
 
-            audio_tensor = torch.from_numpy(audio_chunk).float()
-            audio_tensor = audio_tensor.unsqueeze(0)
+            # Convert to tensor
+            audio_tensor = torch.from_numpy(audio_chunk).float().unsqueeze(0)
 
+            # silero-vad v6.x requires 512 samples per frame (32ms @ 16kHz)
+            frame_size = 512
+            num_frames = audio_tensor.shape[1] // frame_size
+
+            if num_frames == 0:
+                # Audio chunk too small, use energy-based fallback
+                return self._energy_based_detection(audio_chunk)
+
+            # Process each frame and collect probabilities
+            probs = []
             with torch.no_grad():
-                speech_prob = self._model(audio_tensor).item()
+                for i in range(num_frames):
+                    frame = audio_tensor[:, i * frame_size:(i + 1) * frame_size]
+                    if frame.shape[1] == frame_size:
+                        prob = self._model(frame, self._sample_rate).item()
+                        probs.append(prob)
+
+            if not probs:
+                return self._energy_based_detection(audio_chunk)
+
+            # Use max probability as the speech confidence
+            max_prob = max(probs)
+            avg_prob = sum(probs) / len(probs)
+
+            # Weighted: favor max but consider average
+            confidence = 0.7 * max_prob + 0.3 * avg_prob
 
             return VADResult(
-                is_speech=speech_prob > self.threshold,
-                confidence=speech_prob,
+                is_speech=confidence > self.threshold,
+                confidence=confidence,
                 timestamp_ms=0
             )
         except Exception as e:
             logger.error(f"VAD detection error: {e}")
-            return VADResult(is_speech=False, confidence=0.0, timestamp_ms=0)
+            return self._energy_based_detection(audio_chunk)
 
     def _energy_based_detection(self, audio_chunk: np.ndarray) -> VADResult:
         """Fallback energy-based voice detection."""
         rms = np.sqrt(np.mean(audio_chunk ** 2))
-        is_speech = rms > 0.01  # Simple threshold
+        is_speech = rms > 0.02  # Lowered threshold for more sensitive voice detection
 
         return VADResult(
             is_speech=is_speech,
-            confidence=float(rms * 10),  # Scale to 0-1 range
+            confidence=float(min(rms * 20, 1.0)),  # Scale to 0-1 range (adjusted multiplier)
             timestamp_ms=0
         )
 
