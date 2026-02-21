@@ -1,5 +1,14 @@
 # RealTalk Memory
 
+## 2026-02-21: TTS 音频重叠 Bug 根因与修复
+
+- **问题描述**: AI 语音回复出现内容重叠（如"要不你直接打字跟我说吧？"之后听到"打字跟我说吧？"）
+- **根本原因**: `llm.py` `OpenRouterLLM.stream_chat()` 中使用两个独立 `if` 分支，导致当 OpenRouter 最后一条 SSE 同时包含 `content` 和 `finish_reason` 时，同一个 delta 内容被 yield 两次。重复内容进入 `SentenceDivider` buffer，在最后标点处被切成"正常句子"+"重复后缀"两条句子，各触发一次 TTS。
+- **解决方案**: 将两个 `if` 合并为一次 yield，`finish_reason` 附在同一 `LLMResponse` 对象上
+- **预防措施**: LLM `stream_chat` 接口 — 每个 SSE chunk 只能 yield 一次，不能对同一 chunk 做多次 yield；新 LLM 后端接入时必须检查 `content` 与 `finish_reason` 同时存在的 corner case
+
+---
+
 ## 2026-02-20: Phase 1 Frontend Extraction Completed
 
 ### Static File Separation

@@ -213,19 +213,22 @@ class OpenRouterLLM(BaseLLM):
                             data = json.loads(data_str)
                             if "choices" in data and len(data["choices"]) > 0:
                                 delta = data["choices"][0].get("delta", {})
-                                if "content" in delta:
-                                    content_buffer += delta["content"]
+                                content = delta.get("content", "")
+                                finish_reason = data["choices"][0].get("finish_reason")
+
+                                if content:
+                                    content_buffer += content
                                     yield LLMResponse(
-                                        content=delta["content"],
+                                        content=content,
                                         model=data.get("model", self.model_name),
-                                        finish_reason="",
+                                        finish_reason=finish_reason or "",
+                                        usage=data.get("usage") if finish_reason else None
                                     )
-                                if data["choices"][0].get("finish_reason"):
-                                    yield LLMResponse(
-                                        content=delta["content"],
-                                        model=data.get("model", self.model_name),
-                                        finish_reason=data["choices"][0]["finish_reason"],
-                                        usage=data.get("usage")
+                                elif finish_reason:
+                                    # finish_reason chunk with no new content — no need to yield
+                                    logger.debug(
+                                        f"LLM stream finished: reason={finish_reason}, "
+                                        f"total_content={len(content_buffer)} chars"
                                     )
                         except json.JSONDecodeError:
                             continue

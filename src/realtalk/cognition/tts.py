@@ -277,7 +277,11 @@ class MinimaxTTS(BaseTTS):
                     # Yield the last complete MP3 chunk (most complete audio)
                     # Skip earlier ones to avoid duplicate playback
                     last_idx, audio_data = complete_mp3_chunks[-1]
-                    logger.info(f"TTS yielding complete MP3 chunk {last_idx}: {len(audio_data)} bytes")
+                    logger.info(
+                        f"[TTS-STREAM] yielding chunk idx={last_idx} "
+                        f"size={len(audio_data)} has_id3=True "
+                        f"skipped_earlier={[idx for idx, _ in complete_mp3_chunks[:-1]]}"
+                    )
                     yield TTSResult(
                         audio=audio_data,
                         sample_rate=self.sample_rate,

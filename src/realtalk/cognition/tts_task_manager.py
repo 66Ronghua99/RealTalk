@@ -87,8 +87,13 @@ class TTSTaskManager:
             seq = sentence.sequence_number
             text = sentence.effective_text
 
+            logger.info(
+                f"[TTS-MANAGER] task STARTED seq={seq} text={repr(text[:50])}"
+            )
+
             try:
                 if not text:
+                    logger.info(f"[TTS-MANAGER] task SKIP (empty) seq={seq}")
                     await result_queue.put((seq, None, None))
                     return
 
@@ -97,11 +102,17 @@ class TTSTaskManager:
                     timeout=self.config.task_timeout_seconds
                 )
                 result.sequence_number = seq
+                logger.info(
+                    f"[TTS-MANAGER] task DONE seq={seq} "
+                    f"audio_bytes={len(result.audio) if result.audio else 0}"
+                )
                 await result_queue.put((seq, result, None))
 
             except asyncio.TimeoutError:
+                logger.error(f"[TTS-MANAGER] task TIMEOUT seq={seq}")
                 await result_queue.put((seq, None, TimeoutError(f"TTS timeout")))
             except Exception as e:
+                logger.error(f"[TTS-MANAGER] task ERROR seq={seq}: {e}")
                 await result_queue.put((seq, None, e))
 
         async def feed_sentences() -> None:
@@ -114,6 +125,11 @@ class TTSTaskManager:
                 self._max_sequence_submitted = max(
                     self._max_sequence_submitted,
                     sentence.sequence_number
+                )
+
+                logger.info(
+                    f"[TTS-MANAGER] sentence SUBMITTED seq={sentence.sequence_number} "
+                    f"text={repr(sentence.effective_text[:50])}"
                 )
 
                 # Create task for this sentence
@@ -154,15 +170,24 @@ class TTSTaskManager:
 
                     if error:
                         self._stats["errors"] += 1
-                        logger.warning(f"TTS error for sequence {seq}: {error}")
+                        logger.warning(f"[TTS-MANAGER] result ERROR seq={seq}: {error}")
                     elif result:
                         self._stats["completed"] += 1
                         completed_results[seq] = result
+                        logger.info(
+                            f"[TTS-MANAGER] result BUFFERED seq={seq} "
+                            f"next_to_yield={next_to_yield} "
+                            f"buffered={sorted(completed_results.keys())}"
+                        )
 
                     # Yield in order
                     while next_to_yield in completed_results:
                         to_yield = completed_results.pop(next_to_yield)
                         self._stats["yielded"] += 1
+                        logger.info(
+                            f"[TTS-MANAGER] YIELDING seq={next_to_yield} "
+                            f"audio_bytes={len(to_yield.audio) if to_yield.audio else 0}"
+                        )
                         next_to_yield += 1
                         yield to_yield
 

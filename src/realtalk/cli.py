@@ -251,6 +251,7 @@ class CLI:
         self.audio_handler.start()
 
         self._running = True
+        self._audio_chunk_counter = 0  # Global counter for audio chunks
 
         # Store reference to the main event loop for thread-safe callbacks
         self._main_loop = asyncio.get_running_loop()
@@ -325,28 +326,18 @@ class CLI:
         # Run VAD detection
         vad_result = await self.vad.detect(audio_array)
 
-        # Debug VAD result
-        if vad_result.is_speech:
-            logger.debug(f"[VAD] SPEECH detected (confidence: {vad_result.confidence:.3f}, buffer: {len(self._audio_buffer)})")
-        else:
-            logger.debug(f"[VAD] SILENCE (confidence: {vad_result.confidence:.3f}, buffer: {len(self._audio_buffer)})")
-
         if vad_result.is_speech:
             # User is speaking
             if not self._is_speaking:
-                logger.info(f"[DEBUG] 🎤 SPEECH START (confidence: {vad_result.confidence:.3f})")
+                logger.info(f"[VAD] 🎤 SPEECH START (confidence: {vad_result.confidence:.3f})")
             self._audio_buffer.append(audio_chunk)
             self._last_speech_time = timestamp
-            self._consecutive_silence_count = 0  # Reset counter on speech detection
+            self._consecutive_silence_count = 0
             if not self._is_speaking:
                 self._is_speaking = True
-                logger.info(f"[Listening...] Buffer size: {len(self._audio_buffer)} chunks")
         else:
-            # No speech detected - increment silence counter
+            # No speech detected
             self._consecutive_silence_count += 1
-            if self._is_speaking and self._consecutive_silence_count <= self._required_silence_frames:
-                pass
-                # logger.info(f"[DEBUG] 🔇 Silence frame {self._consecutive_silence_count}/{self._required_silence_frames} (confidence: {vad_result.confidence:.3f}, rms: {vad_result.confidence/20:.4f})")
 
     async def _check_silence_timeout(self):
         """Check if continuous silence threshold exceeded and process audio."""
@@ -436,11 +427,23 @@ class CLI:
 
         call_id = self._current_call_id or "unknown"
 
+        # Global counter to track if multiple chunks are in-flight simultaneously
+        self._audio_chunk_counter += 1
+        chunk_id = self._audio_chunk_counter
+        enqueue_ts = time.monotonic()
+
         # Deduplication: check if this exact audio was already played
         audio_hash = hashlib.md5(audio_data[:1024]).hexdigest()  # Hash first 1KB for speed
 
+        logger.info(
+            f"[AUDIO-TRACE] chunk_id={chunk_id} RECEIVED size={len(audio_data)} "
+            f"hash={audio_hash[:8]} call_id={call_id}"
+        )
+
         if audio_hash in self._played_audio_hashes:
-            logger.warning(f"[DEBUG-{call_id}] ⚠️ SKIPPING DUPLICATE audio chunk (hash: {audio_hash[:8]}...)")
+            logger.warning(
+                f"[AUDIO-TRACE] chunk_id={chunk_id} DUPLICATE SKIP hash={audio_hash[:8]}"
+            )
             return
 
         # Add to played set
@@ -448,7 +451,6 @@ class CLI:
 
         # Limit history size
         if len(self._played_audio_hashes) > self._max_hash_history:
-            # Remove oldest (arbitrary removal since set is unordered)
             self._played_audio_hashes.pop()
 
         # Save TTS audio for debugging
@@ -456,11 +458,25 @@ class CLI:
         self._tts_counter = tts_counter + 1
         tts_audio_path = self._debug_dir / f"tts_{call_id}_{tts_counter:03d}_{audio_hash[:8]}.mp3"
         tts_audio_path.write_bytes(audio_data)
-        logger.info(f"[DEBUG-{call_id}] 💾 TTS audio saved: {tts_audio_path.name} (size: {len(audio_data)} bytes, hash: {audio_hash[:8]}...)")
+        logger.info(
+            f"[AUDIO-TRACE] chunk_id={chunk_id} SAVED {tts_audio_path.name}"
+        )
 
-        logger.info(f"[DEBUG-{call_id}] 🔊 Playing audio chunk #{tts_counter} (hash: {audio_hash[:8]}...), size: {len(audio_data)} bytes")
+        start_ts = time.monotonic()
+        wait_ms = (start_ts - enqueue_ts) * 1000
+        logger.info(
+            f"[AUDIO-TRACE] chunk_id={chunk_id} PLAY_START "
+            f"wait={wait_ms:.1f}ms size={len(audio_data)}"
+        )
+
         await self.audio_handler.play_audio(audio_data)
-        logger.info(f"[DEBUG-{call_id}] ✅ Audio chunk #{tts_counter} playback complete")
+
+        end_ts = time.monotonic()
+        play_ms = (end_ts - start_ts) * 1000
+        logger.info(
+            f"[AUDIO-TRACE] chunk_id={chunk_id} PLAY_END "
+            f"duration={play_ms:.1f}ms"
+        )
 
     async def _generate_response(self, text: str, call_id: str):
         """Generate LLM response and speak it using ResponseGenerator."""

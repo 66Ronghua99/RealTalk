@@ -200,6 +200,7 @@ class StreamingPipeline:
             )
 
             # Process through TTS manager with ordered delivery
+            yield_idx = 0
             async for tts_result in self._tts_manager.process_sentences(sentence_stream):
                 if self._should_stop:
                     break
@@ -208,8 +209,19 @@ class StreamingPipeline:
                 if tts_result.text:
                     full_response = tts_result.text
 
+                logger.info(
+                    f"[PIPELINE-TTS] yield#{yield_idx} seq={tts_result.sequence_number} "
+                    f"audio_bytes={len(tts_result.audio) if tts_result.audio else 0} "
+                    f"is_final={tts_result.is_final} text={repr(tts_result.text[:40])}"
+                )
+                yield_idx += 1
+
                 # Notify callbacks
                 if self._on_audio_chunk and tts_result.audio:
+                    logger.info(
+                        f"[PIPELINE-CALLBACK] firing on_audio_chunk for seq={tts_result.sequence_number} "
+                        f"audio_bytes={len(tts_result.audio)}"
+                    )
                     self._on_audio_chunk(tts_result.audio)
 
                 yield tts_result
@@ -241,6 +253,8 @@ class StreamingPipeline:
 
         Accumulates content to build full response text.
         """
+        accumulated = ""
+        token_idx = 0
         async for response in llm_stream:
             if self._should_stop:
                 break
@@ -248,6 +262,13 @@ class StreamingPipeline:
             content = response.content
             if not content:
                 continue
+
+            accumulated += content
+            logger.debug(
+                f"[PIPELINE-LLM] token#{token_idx} delta={repr(content)!s:30s} "
+                f"accumulated_len={len(accumulated)}"
+            )
+            token_idx += 1
 
             # Yield the delta content for sentence processing
             yield content
