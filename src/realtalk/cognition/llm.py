@@ -80,7 +80,24 @@ class OpenRouterLLM(BaseLLM):
 
     async def _get_session(self) -> aiohttp.ClientSession:
         """Get or create HTTP session."""
-        if self._session is None or self._session.closed:
+        need_new_session = self._session is None or self._session.closed
+
+        # Check if the session's event loop is still valid
+        # by attempting to get the running loop and comparing
+        if self._session is not None and not self._session.closed:
+            try:
+                current_loop = asyncio.get_running_loop()
+                session_loop = getattr(self._session, '_loop', None)
+                if session_loop is not None and session_loop is not current_loop:
+                    logger.debug("Event loop mismatch, creating new aiohttp session")
+                    need_new_session = True
+                    await self._session.close()
+            except RuntimeError:
+                # No event loop running, need new session
+                need_new_session = True
+                await self._session.close()
+
+        if need_new_session:
             self._session = aiohttp.ClientSession()
         return self._session
 
@@ -199,13 +216,13 @@ class OpenRouterLLM(BaseLLM):
                                 if "content" in delta:
                                     content_buffer += delta["content"]
                                     yield LLMResponse(
-                                        content=content_buffer,
+                                        content=delta["content"],
                                         model=data.get("model", self.model_name),
                                         finish_reason="",
                                     )
                                 if data["choices"][0].get("finish_reason"):
                                     yield LLMResponse(
-                                        content=content_buffer,
+                                        content=delta["content"],
                                         model=data.get("model", self.model_name),
                                         finish_reason=data["choices"][0]["finish_reason"],
                                         usage=data.get("usage")
@@ -245,7 +262,24 @@ class QwenLLM(BaseLLM):
 
     async def _get_session(self) -> aiohttp.ClientSession:
         """Get or create HTTP session."""
-        if self._session is None or self._session.closed:
+        need_new_session = self._session is None or self._session.closed
+
+        # Check if the session's event loop is still valid
+        # by attempting to get the running loop and comparing
+        if self._session is not None and not self._session.closed:
+            try:
+                current_loop = asyncio.get_running_loop()
+                session_loop = getattr(self._session, '_loop', None)
+                if session_loop is not None and session_loop is not current_loop:
+                    logger.debug("Event loop mismatch, creating new aiohttp session")
+                    need_new_session = True
+                    await self._session.close()
+            except RuntimeError:
+                # No event loop running, need new session
+                need_new_session = True
+                await self._session.close()
+
+        if need_new_session:
             self._session = aiohttp.ClientSession()
         return self._session
 
@@ -348,7 +382,7 @@ class QwenLLM(BaseLLM):
                             if "content" in delta:
                                 content_buffer += delta["content"]
                                 yield LLMResponse(
-                                    content=content_buffer,
+                                    content=delta["content"],
                                     model=self.model_name,
                                     finish_reason="",
                                 )
