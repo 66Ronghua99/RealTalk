@@ -45,6 +45,7 @@ class AudioHandler:
         self._last_speech_time: Optional[float] = None
         self._silence_threshold_ms = 1500  # Silence threshold to detect speech end (0.8s for more responsive capture)
         self._is_playing = False  # Track playback state for echo suppression
+        self._playback_lock = asyncio.Lock()  # Ensure audio snippets play sequentially
 
     def set_audio_callback(self, callback):
         """Set callback for incoming audio data."""
@@ -111,44 +112,48 @@ class AudioHandler:
         if not self._output_stream or not self._running:
             return
 
-        self._is_playing = True
+        async with self._playback_lock:
+            self._is_playing = True
 
-        try:
-            # Use soundfile to read WAV
-            import soundfile as sf
+            try:
+                # Use soundfile to read WAV
+                import soundfile as sf
 
-            # Read audio data
-            audio_array, sample_rate = sf.read(io.BytesIO(audio_data), dtype='float32')
+                # Read audio data
+                audio_array, sample_rate = sf.read(io.BytesIO(audio_data), dtype='float32')
 
-            # Mono to stereo if needed
-            if len(audio_array.shape) == 1:
-                pass  # Already mono
-            else:
-                audio_array = audio_array[:, 0]  # Take first channel
+                # Mono to stereo if needed
+                if len(audio_array.shape) == 1:
+                    pass  # Already mono
+                else:
+                    audio_array = audio_array[:, 0]  # Take first channel
 
-            # If sample rate doesn't match, simple linear resample
-            if sample_rate != target_sample_rate:
-                num_samples = int(len(audio_array) * target_sample_rate / sample_rate)
-                indices = np.linspace(0, len(audio_array) - 1, num_samples)
-                audio_array = np.interp(indices, np.arange(len(audio_array)), audio_array)
+                # If sample rate doesn't match, simple linear resample
+                if sample_rate != target_sample_rate:
+                    num_samples = int(len(audio_array) * target_sample_rate / sample_rate)
+                    indices = np.linspace(0, len(audio_array) - 1, num_samples)
+                    audio_array = np.interp(indices, np.arange(len(audio_array)), audio_array)
 
-            # Write in chunks
-            block_size = 1600
-            for i in range(0, len(audio_array), block_size):
-                if not self._running:
-                    break
-                chunk = audio_array[i:i + block_size]
-                if len(chunk) < block_size:
-                    chunk = np.pad(chunk, (0, block_size - len(chunk)))
-                try:
-                    self._output_stream.write(chunk)
-                except:
-                    pass
+                # Write in chunks using executor to avoid blocking event loop
+                block_size = 1600
+                loop = asyncio.get_running_loop()
+                for i in range(0, len(audio_array), block_size):
+                    if not self._running:
+                        break
+                    chunk = audio_array[i:i + block_size]
+                    if len(chunk) < block_size:
+                        chunk = np.pad(chunk, (0, block_size - len(chunk)))
+                    try:
+                        await loop.run_in_executor(None, self._output_stream.write, chunk)
+                    except:
+                        pass
 
-        except Exception as e:
-            logger.error(f"Playback error: {e}")
-        finally:
-            self._is_playing = False
+            except Exception as e:
+                logger.error(f"Playback error: {e}")
+            finally:
+                # Wait a bit for echo to dissipate before reenabling mic
+                await asyncio.sleep(0.3)
+                self._is_playing = False
 
 
 class CLI:
@@ -284,6 +289,10 @@ class CLI:
         so we use asyncio.Queue to safely pass data to the async processor.
         """
         if not self._running or self._main_loop is None:
+            return
+
+        # Skip enqueueing if we are currently playing audio (suppress acoustic echo)
+        if self.audio_handler and self.audio_handler.is_currently_playing():
             return
 
         # Use time.monotonic() for thread-safe timestamp

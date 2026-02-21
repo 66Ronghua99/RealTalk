@@ -311,3 +311,26 @@ ls -la debug_cli_*/
 # Play back captured input audio
 ffplay -f s16le -ar 16000 -ac 1 debug_cli_*/input_*.pcm
 ```
+
+---
+
+### 2026-02-21: Asyncio Event Loop Blocking & Echo Prevention
+
+**问题描述**：
+日志显示 AI 刚刚完成一句长段落的语音播放（2-3秒），11ms 后 VAD 立刻触发记录，并将 AI 刚说过的话通过 ASR 原封不动地识别了出来，导致死循环进行回答。
+
+**根本原因**：
+三个设计缺陷互相叠加：
+1. `AudioHandler.play_audio` 中使用了阻塞型的 `output_stream.write(chunk)` 调用。因为在 `asyncio` Task 中执行阻塞操作，导致整个 Event Loop 被卡住，系统无法及时处理队列中的数据。
+2. 由于 Event Loop 被卡住，在播放 TTS 的 2-3 秒内，麦克风将这段时间听到的"回音"全部积压在 `asyncio.Queue` 中。
+3. 播放一结束，Event Loop 恢复，积压的回音由于 `_is_playing` 在 `finally` 块中立即被置为 `False`，导致它们不仅没有被抑制，反而瞬间全被 VAD 消费，从而触发判定 AI 给自己说话。
+
+**解决方案**：
+1. **防止阻塞循环**：改用 `await loop.run_in_executor(None, self._output_stream.write, chunk)` 来执行阻塞的音频输出。
+2. **提前丢弃保护**：在最外层的 `_on_audio_input`（声卡底层回调）中，通过 `self.audio_handler.is_currently_playing()` 直接抛弃处于正在播放状态的麦克风输入流，而不放入 `asyncio.Queue` 中。
+3. **播放控制**：引入 `asyncio.Lock()` 实现不同并发块中分段 TTS 的强制有序与同步播放。
+4. **混响延时**：在播放完成时加入 `await asyncio.sleep(0.3)`，使得房间中的混响和硬件电信号残留能有时间耗散，再将开放录音。
+
+**预防措施**：
+- 绝对不要在 async 函数中执行大体积数据的同步 I/O。
+- 设计双工交互防回音（Echo Cancellation/Suppression）时，抑制动作应尽可能早地在数据生产源头（底层输入 Callback 侧）阻断，而非在队列消费侧做判断。

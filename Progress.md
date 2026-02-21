@@ -53,7 +53,16 @@ Implemented half-duplex mode in CLI to prevent AI from responding to its own voi
 - **修复**: 引入连续静音帧计数器（`_consecutive_silence_count`），需要连续 15 帧（1.5秒）静音才触发
 - **逻辑**: 检测到语音时重置计数器，只有连续静音帧达标才处理
 
-所有 P0 fixes 已推送至 master。
+#### Fix 6: AI 录入自身回复 (TTS Echo Recording)
+- **文件**: `src/realtalk/cli.py`
+- **问题**: AI 会把刚播放完的大段 TTS 语音原文重新识别为用户输入。原因是播放 TTS 音频的 `write()` 操作阻塞了 Asyncio Event Loop，使得麦克风输入队列堆积。播放完成后，积压的录音（含回音）立刻被 VAD 并发处理，错误地判定为有效输入。
+- **修复**: 
+  1. 使用 `run_in_executor` 将 `write()` 脱离主事件循环
+  2. 加入 `asyncio.Lock()` 强制音频片段串行播放
+  3. 在麦克风底层回调中提前检查 `is_currently_playing()` 并直接丢弃音频
+  4. 播放完成后加入 300ms 的保护窗口以等待房间残响消散
+
+所有 P0 fixes 已推送至 master（除了 Fix 6 位于本地最新迭代中）。
 
 ### ✅ Completed: Phase 1 - Frontend/Backend Separation
 
