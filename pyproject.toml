@@ -18,6 +18,9 @@ dependencies = [
     "onnxruntime==1.23.2",
     "uvicorn>=0.40.0",
     "hupper>=1.12.1",
+    "torch>=2.0.0",
+    "webrtcvad-wheels>=2.0.14",
+    "silero-vad>=6.2.0",
 ]
 
 [project.scripts]
