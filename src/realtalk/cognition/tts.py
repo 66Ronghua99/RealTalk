@@ -226,14 +226,11 @@ class MinimaxTTS(BaseTTS):
                     if line_str.startswith("data: ") and line_str[6:] != "[DONE]":
                         audio_lines.append(line_str[6:])
 
-                # Yield all audio chunks except last one as not final, last one as final
-                for i, data_str in enumerate(audio_lines):
-                    if self._stop_event.is_set():
-                        break
-
+                # Parse all audio chunks first
+                parsed_chunks = []
+                for data_str in audio_lines:
                     try:
                         data = json.loads(data_str)
-                        logger.info(f"TTS data keys: {data.keys()}")
 
                         # Check for API error
                         if "base_resp" in data and data["base_resp"].get("status_code") != 0:
@@ -246,22 +243,45 @@ class MinimaxTTS(BaseTTS):
                             # Note: API returns hex-encoded string
                             if isinstance(audio_data, str):
                                 audio_data = bytes.fromhex(audio_data)  # Decode hex string
-                            logger.info(f"TTS audio field type: {type(audio_data)}, length: {len(audio_data) if audio_data else 0}")
-
-                            # Set is_final=True only for the last chunk
-                            is_final = (i == len(audio_lines) - 1)
-
-                            yield TTSResult(
-                                audio=audio_data,
-                                sample_rate=self.sample_rate,
-                                is_final=is_final,
-                                text=text
-                            )
-                        else:
-                            logger.warning(f"TTS data format unexpected: {data}")
-                    except json.JSONDecodeError as e:
-                        logger.warning(f"TTS JSON decode error: {e}")
+                            parsed_chunks.append(audio_data)
+                            logger.info(f"TTS chunk parsed: {len(audio_data)} bytes")
+                    except json.JSONDecodeError:
                         continue
+
+                # Minimax API returns incremental chunks + a final complete audio chunk.
+                # To avoid duplicate playback, we only yield the incremental chunks
+                # and skip the final complete audio chunk.
+                # Yield all chunks except the last one (which is the complete audio)
+                if len(parsed_chunks) > 1:
+                    for i, audio_data in enumerate(parsed_chunks[:-1]):
+                        if self._stop_event.is_set():
+                            break
+
+                        logger.info(f"TTS yielding incremental chunk {i}: {len(audio_data)} bytes")
+                        yield TTSResult(
+                            audio=audio_data,
+                            sample_rate=self.sample_rate,
+                            is_final=False,
+                            text=text
+                        )
+
+                    logger.info(f"TTS: skipped final complete audio chunk ({len(parsed_chunks[-1])} bytes) to avoid duplicate playback")
+                elif len(parsed_chunks) == 1:
+                    # Only one chunk, yield it (non-streaming case)
+                    yield TTSResult(
+                        audio=parsed_chunks[0],
+                        sample_rate=self.sample_rate,
+                        is_final=False,
+                        text=text
+                    )
+
+                # Yield final marker
+                yield TTSResult(
+                    audio=None,
+                    sample_rate=self.sample_rate,
+                    is_final=True,
+                    text=text
+                )
 
                 logger.info("TTS stream done")
 
