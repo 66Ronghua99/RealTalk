@@ -18,11 +18,20 @@ logger = setup_logger("realtalk.tts")
 
 @dataclass
 class TTSResult:
-    """TTS synthesis result."""
+    """TTS synthesis result.
+
+    Attributes:
+        audio: Raw audio bytes (None for final marker)
+        sample_rate: Audio sample rate in Hz
+        is_final: True if this is the final marker for the stream
+        text: Source text that was synthesized
+        sequence_number: Sequence ID for ordered delivery in streaming pipeline
+    """
     audio: Optional[bytes]
     sample_rate: int
     is_final: bool
     text: str
+    sequence_number: int = 0
 
 
 class BaseTTS(ABC):
@@ -248,24 +257,45 @@ class MinimaxTTS(BaseTTS):
                     except json.JSONDecodeError:
                         continue
 
-                # Minimax API returns incremental chunks + a final complete audio chunk.
-                # To avoid duplicate playback, we only yield the incremental chunks
-                # and skip the final complete audio chunk.
-                # Yield all chunks except the last one (which is the complete audio)
-                if len(parsed_chunks) > 1:
-                    for i, audio_data in enumerate(parsed_chunks[:-1]):
-                        if self._stop_event.is_set():
-                            break
+                # Log all parsed chunks for debugging
+                logger.info(f"TTS total chunks: {len(parsed_chunks)}")
+                for i, chunk in enumerate(parsed_chunks):
+                    has_id3 = chunk[:3] == b'ID3' if len(chunk) > 10 else False
+                    logger.info(f"TTS chunk {i}: {len(chunk)} bytes, has_id3={has_id3}")
 
-                        logger.info(f"TTS yielding incremental chunk {i}: {len(audio_data)} bytes")
-                        yield TTSResult(
-                            audio=audio_data,
-                            sample_rate=self.sample_rate,
-                            is_final=False,
-                            text=text
-                        )
+                # Minimax API returns a mix of complete MP3 files and raw MP3 frames.
+                # Chunks with ID3 headers are complete MP3 files that can be played standalone.
+                # Chunks without ID3 headers are raw MP3 frames that cannot be played directly.
+                # The last chunk with ID3 header is the most complete audio.
+                # Filter to only yield chunks with ID3 headers (complete MP3 files)
+                complete_mp3_chunks = [
+                    (i, chunk) for i, chunk in enumerate(parsed_chunks)
+                    if len(chunk) > 1000 and chunk[:3] == b'ID3'
+                ]
 
-                    logger.info(f"TTS: skipped final complete audio chunk ({len(parsed_chunks[-1])} bytes) to avoid duplicate playback")
+                if complete_mp3_chunks:
+                    # Yield the last complete MP3 chunk (most complete audio)
+                    # Skip earlier ones to avoid duplicate playback
+                    last_idx, audio_data = complete_mp3_chunks[-1]
+                    logger.info(f"TTS yielding complete MP3 chunk {last_idx}: {len(audio_data)} bytes")
+                    yield TTSResult(
+                        audio=audio_data,
+                        sample_rate=self.sample_rate,
+                        is_final=False,
+                        text=text
+                    )
+
+                    # Mark other complete chunks as skipped
+                    if len(complete_mp3_chunks) > 1:
+                        skipped = [idx for idx, _ in complete_mp3_chunks[:-1]]
+                        logger.info(f"TTS: skipped earlier complete chunks to avoid duplicate: {skipped}")
+
+                    # Log raw frames that were skipped
+                    raw_frames = [i for i, chunk in enumerate(parsed_chunks)
+                                  if len(chunk) > 1000 and chunk[:3] != b'ID3']
+                    if raw_frames:
+                        logger.debug(f"TTS: skipped raw MP3 frames (cannot play directly): {raw_frames}")
+
                 elif len(parsed_chunks) == 1:
                     # Only one chunk, yield it (non-streaming case)
                     yield TTSResult(
