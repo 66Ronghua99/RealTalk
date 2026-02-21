@@ -217,6 +217,7 @@ class SherpaOnnxASR(BaseASR):
                 tokens=str(tokens_file),
                 num_threads=self.num_threads,
                 use_itn=self.use_itn,
+                language="zh",  # Force Chinese language
             )
             logger.info("Sherpa-ONNX SenseVoice ASR loaded")
         except Exception as e:
