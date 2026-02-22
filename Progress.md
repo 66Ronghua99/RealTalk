@@ -232,3 +232,40 @@ uv run realtalk-cli 2>&1 | grep "DEBUG-1771674395_1"
 | Streaming pipeline tests | 18 |
 | Message types | 14 |
 | API version | 1.0.0 |
+
+## Phase 5: Full-Duplex Interrupt Detection (Completed 2026-02-22)
+
+### Goals
+- 允许用户在TTS播放过程中通过说话打断AI
+- 同时确保回声不会被误判为打断指令
+
+### Solution: Dual-Filter Interrupt Detection
+
+**不引入新库**，使用纯算法方案：
+
+| Stage | Filter | Logic |
+|-------|--------|-------|
+| Stage 1 | Energy Gate | `mic_rms > speaker_rms × attenuation_factor AND mic_rms > 0.01` |
+| Stage 2 | High-threshold VAD | `silero_confidence >= 0.82` |
+| Confirm | Frame Counter | 需要连续 3 帧通过才触发打断 |
+
+### Key Changes
+- **`AudioHandler`**: 全双工改造——`_audio_callback_wrapper` 不再在播放期间丢弃输入；`play_audio()` 实时更新 `_speaker_rms`；新增 `request_interrupt()` 立即中止播放
+- **`CLI._on_audio_input()`**: 移除播放期间的 `return`，始终入队
+- **`CLI._process_audio_chunk()`**: 播放期间改为"打断检测模式"（双重过滤），正常期间保持原有VAD逻辑
+- **`CLI._handle_interrupt()`**: 新方法，停止pipeline、终止播放、清空队列、开始收集新语音
+- **`CLI._generate_response()`**: 并发保护改为等待重试（最多1s），支持打断后快速重启
+
+### Configurable Parameters
+| 参数 | 默认值 | 说明 |
+|------|--------|------|
+| `_echo_attenuation_factor` | 0.4 | 回声能量衰减比（环境相关，可调） |
+| `_interrupt_vad_threshold` | 0.82 | 打断模式VAD置信度阈值 |
+| `_interrupt_required_frames` | 3 | 需要连续N帧才触发 |
+
+### Stats
+| Metric | Value |
+|--------|-------|
+| New tests | 10 (test_interrupt_detection.py) |
+| Total tests | 104 (94 + 10 new) |
+

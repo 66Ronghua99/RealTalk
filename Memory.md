@@ -314,7 +314,49 @@ ffplay -f s16le -ar 16000 -ac 1 debug_cli_*/input_*.pcm
 
 ---
 
-### 2026-02-21: Asyncio Event Loop Blocking & Echo Prevention
+### 2026-02-22: 全双工打断检测（无需AEC库）
+
+**问题描述**：
+TTS播放期间麦克风输入被完全丢弃，导致用户无法打断AI说话。
+
+**根本原因**：
+为解决回声问题采用了最简单但体验差的方法——直接在 `_on_audio_input()` 底层回调里丢弃输入。
+
+**解决方案**：
+不引入 speexdsp/WebRTC AEC 库，使用**双重过滤算法**识别人声 vs 回声：
+
+```python
+# Stage 1: Energy gate
+energy_ok = mic_rms > speaker_rms * echo_attenuation_factor and mic_rms > 0.01
+
+# Stage 2: High-threshold VAD (much stricter than normal)
+if energy_ok:
+    vad_result = await self.vad.detect(audio_array)
+    vad_ok = vad_result.confidence >= 0.82  # vs normal 0.5
+
+# Stage 3: Frame counter (filter transients)
+if vad_ok:
+    interrupt_frame_count += 1
+    if interrupt_frame_count >= 3:
+        trigger_interrupt()
+```
+
+**关键设计决策**：
+- `AudioHandler.play_audio()` 实时更新 `_speaker_rms`（每个100ms播放块），供打断检测比对
+- `request_interrupt()` 设置标志，播放循环在下一个100ms块检测到后立即退出
+- 打断后等待仅0.15s（vs 正常的0.3s），因为用户已经在说话了
+- `_generate_response()` 的并发保护从"立即skip"改为"等待重试1s"，适配打断后的快速重启
+
+**环境相关参数**（需根据硬件调整）：
+- `_echo_attenuation_factor = 0.4`：内置MacBook扬声器+麦克风的估算衰减比
+- 耳机使用者：回声极小，可设为 0.1~0.2
+- 外接独立扬声器：距离远，可设为 0.5~0.7
+
+**预防措施**：
+- 在设计语音类应用时，从一开始就考虑全双工架构，而非事后补丁
+- AEC库（speexdsp）在 macOS ARM 上存在编译问题，纯算法方案更可靠
+- 调试时在日志中始终打印 `mic_rms` vs `speaker_rms` 的实际比值，便于校准系数
+
 
 **问题描述**：
 日志显示 AI 刚刚完成一句长段落的语音播放（2-3秒），11ms 后 VAD 立刻触发记录，并将 AI 刚说过的话通过 ASR 原封不动地识别了出来，导致死循环进行回答。
@@ -334,3 +376,43 @@ ffplay -f s16le -ar 16000 -ac 1 debug_cli_*/input_*.pcm
 **预防措施**：
 - 绝对不要在 async 函数中执行大体积数据的同步 I/O。
 - 设计双工交互防回音（Echo Cancellation/Suppression）时，抑制动作应尽可能早地在数据生产源头（底层输入 Callback 侧）阻断，而非在队列消费侧做判断。
+
+---
+
+### 2026-02-22: 外放音量高时 VAD 长时间保持 0.99 导致误打断
+
+**问题描述：**
+Mac 外放声音较大时，TTS 播放期间麦克风持续捕获回声，VAD 给出 0.97-1.00 置信度，导致打断检测误触发。即使实现了能量门槛（`energy_ok`），`speaker_rms=0.0` 时 `echo_threshold=0.0`，任何麦克风声音都能通过。
+
+**根本原因（三个叠加 Bug）：**
+1. **瞬时 `_speaker_rms` 在块间隙归零**：`play_audio()` 在每个 100ms 块执行时才更新 `_speaker_rms`，块间空隙或最后 `finally` 块清零后，`echo_threshold=0`，能量门槛完全失效
+2. **播放后无抑制窗口**：`_is_playing=False` 后立即切换到正常 VAD 模式，房间混响（来不及消散）被当作人声处理
+3. **VAD 无法区分回声**：Silero VAD 看到的是麦克风捕获的语音信号，不管是真人还是回声都给高 confidence
+
+**解决方案：**
+1. **Peak-hold `_peak_speaker_rms`**：用带衰减的峰值保持（每块乘衰减系数 0.85）替代瞬时值，即使块间隙也不会归零
+2. **后播放冷却期（500ms）**：播放结束后设置 `_post_play_cooldown_until = monotonic() + 0.5`，冷却期内直接丢弃麦克风输入
+3. **新增 `is_in_echo_suppression_window()`**：统一判断"是否在回声风险期"（播放中 OR 冷却期内）
+4. **提高 VAD 阈值至 0.95**：从 `0.8` 提高，过滤更多回声误判（但主要防线是峰值保持的能量门槛）
+
+```python
+# AudioHandler: peak-hold RMS
+chunk_rms = float(np.sqrt(np.mean(chunk ** 2)))
+self._peak_speaker_rms = max(chunk_rms, self._peak_speaker_rms * 0.85)
+
+# finally 块：设置冷却期
+cooldown_s = 0.3 if interrupted else 0.5
+self._post_play_cooldown_until = time.monotonic() + cooldown_s
+self._peak_speaker_rms = 0.0  # 冷却期已设，再清零
+
+# CLI._process_audio_chunk
+in_echo_window = self.audio_handler.is_in_echo_suppression_window()
+if in_echo_window and not is_actively_playing:
+    return  # 冷却期：直接丢弃
+```
+
+**预防措施：**
+- 任何基于"播放状态"的过滤必须同时考虑：① 播放中 ② 播放刚结束的余响期
+- 绝不用瞬时值做能量门槛，必须用 peak-hold 或平滑值
+- 在 Memory 中记录 `_echo_attenuation_factor=0.72`（MacBook 内置扬声器+麦克风经验值）
+
